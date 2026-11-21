@@ -621,12 +621,380 @@ final class TestShare: XCTestCase {
     XCTAssertEqual(results1, [1, 2, 3, 4, 5])
     XCTAssertEqual(results2, [])  // Should be empty since source is exhausted
   }
+
+  // MARK: - Resource Release Tests
+
+  // Inline iteration that breaks: the sequence is released before its only iterator (bounded(1)).
+  func test_share_releases_base_iterator_after_inline_iteration() async {
+    let released = expectation(description: "base iterator released")
+    for await _ in TrackedCounter(onIteratorRelease: { released.fulfill() }).share() {
+      break
+    }
+    await fulfillment(of: [released], timeout: 2)
+  }
+
+  // Inline iteration that breaks, with an unbounded buffer: the sequence is released before its
+  // only iterator.
+  func test_share_releases_base_iterator_after_inline_iteration_unbounded() async {
+    let released = expectation(description: "base iterator released")
+    let source = TrackedCounter(onIteratorRelease: { released.fulfill() })
+    for await _ in source.share(bufferingPolicy: .unbounded) {
+      break
+    }
+    await fulfillment(of: [released], timeout: 2)
+  }
+
+  // Inline iteration of a finite base run to the end: the sequence is released before its only
+  // iterator.
+  func test_share_releases_base_iterator_after_inline_iteration_to_completion() async {
+    let released = expectation(description: "base iterator released")
+    var results = [Int]()
+    for await value in TrackedElements([1, 2, 3], onIteratorRelease: { released.fulfill() }).share() {
+      results.append(value)
+    }
+    XCTAssertEqual(results, [1, 2, 3])
+    await fulfillment(of: [released], timeout: 2)
+  }
+
+  // Inline iteration of a throwing base that breaks before the base fails: the sequence is
+  // released before its only iterator.
+  func test_share_releases_base_iterator_after_inline_iteration_of_throwing_base() async {
+    let released = expectation(description: "base iterator released")
+    let source = TrackedFailingElements([1, 2], onIteratorRelease: { released.fulfill() })
+    do {
+      for try await value in source.share() {
+        XCTAssertEqual(value, 1)
+        break
+      }
+    } catch {
+      XCTFail("unexpected error \(error)")
+    }
+    await fulfillment(of: [released], timeout: 2)
+  }
+
+  // One iterator takes an element while a second never calls next(), so the bounded buffer is full.
+  // Both iterators are released, then the sequence, while the iteration is parked on the full buffer.
+  func test_share_releases_base_iterator_when_sequence_released_last_with_full_buffer() async {
+    let released = expectation(description: "base iterator released")
+    var shared = Optional(TrackedCounter(onIteratorRelease: { released.fulfill() }).share())
+    var consumer = Optional(shared!.makeAsyncIterator())
+    var idle = Optional(shared!.makeAsyncIterator())
+    let first = await consumer!.next(isolation: nil)
+    XCTAssertEqual(first, 1)
+    XCTAssertNotNil(idle)
+    consumer = nil
+    idle = nil
+    shared = nil
+    await fulfillment(of: [released], timeout: 2)
+  }
+
+  // Same as above, but the idle iterator is released first, which wakes the iteration from the full
+  // buffer; the other iterator and then the sequence are released straight after.
+  func test_share_releases_base_iterator_when_idle_iterator_released_first() async {
+    let released = expectation(description: "base iterator released")
+    var shared = Optional(TrackedCounter(onIteratorRelease: { released.fulfill() }).share())
+    var consumer = Optional(shared!.makeAsyncIterator())
+    var idle = Optional(shared!.makeAsyncIterator())
+    let first = await consumer!.next(isolation: nil)
+    XCTAssertEqual(first, 1)
+    XCTAssertNotNil(idle)
+    idle = nil
+    consumer = nil
+    shared = nil
+    await fulfillment(of: [released], timeout: 2)
+  }
+
+  // The only consumer is cancelled while a cancellation-ignoring base is inside next(); the sequence
+  // is then released, and only after that does the base produce its element (bounded(1)).
+  func test_share_releases_base_iterator_after_consumer_cancelled_during_base_next() async {
+    await assertReleasesAfterConsumerCancelledDuringBaseNext(bufferingPolicy: .bounded(1))
+  }
+
+  // Same as above, with an unbounded buffer.
+  func test_share_releases_base_iterator_after_consumer_cancelled_during_base_next_unbounded() async {
+    await assertReleasesAfterConsumerCancelledDuringBaseNext(bufferingPolicy: .unbounded)
+  }
+
+  // The sequence is released while its only consumer is suspended in next(), then the consumer task
+  // is cancelled; the base honours cancellation (unbounded).
+  func test_share_releases_base_iterator_when_consumer_cancelled_after_sequence_released_unbounded() async {
+    await assertReleasesWhenConsumerCancelledAfterSequenceReleased(
+      bufferingPolicy: .unbounded,
+      honoursCancellation: true
+    )
+  }
+
+  // Same as above, but with a cancellation-ignoring base and a bounded(1) buffer.
+  func test_share_releases_base_iterator_when_consumer_cancelled_after_sequence_released_ignoring_cancellation()
+    async
+  {
+    await assertReleasesWhenConsumerCancelledAfterSequenceReleased(
+      bufferingPolicy: .bounded(1),
+      honoursCancellation: false
+    )
+  }
+
+  // Same as above, but with a base that honours cancellation and a bounded(1) buffer.
+  func test_share_releases_base_iterator_when_consumer_cancelled_after_sequence_released_honouring_cancellation()
+    async
+  {
+    await assertReleasesWhenConsumerCancelledAfterSequenceReleased(
+      bufferingPolicy: .bounded(1),
+      honoursCancellation: true
+    )
+  }
+
+  // A stored sequence is iterated until a break, then released after its iterator (bounded(1)).
+  func test_share_releases_base_iterator_when_stored_sequence_released_after_break() async {
+    await assertReleasesWhenStoredSequenceReleasedAfterBreak(bufferingPolicy: .bounded(1))
+  }
+
+  // Same as above, with an unbounded buffer.
+  func test_share_releases_base_iterator_when_stored_sequence_released_after_break_unbounded() async {
+    await assertReleasesWhenStoredSequenceReleasedAfterBreak(bufferingPolicy: .unbounded)
+  }
+
+  // Inline iteration of a throwing base that fails on its first next().
+  func test_share_releases_base_iterator_when_throwing_base_fails_immediately() async {
+    let released = expectation(description: "base iterator released")
+    let source = TrackedFailingElements([], onIteratorRelease: { released.fulfill() })
+    do {
+      for try await _ in source.share() {
+        XCTFail("unexpected element")
+      }
+      XCTFail("expected the base to fail")
+    } catch {
+      XCTAssertEqual(error as? TestError, .failure)
+    }
+    await fulfillment(of: [released], timeout: 2)
+  }
+
+  // Inline iteration of a throwing base that fails after two elements.
+  func test_share_releases_base_iterator_when_throwing_base_fails_after_elements() async {
+    let released = expectation(description: "base iterator released")
+    let source = TrackedFailingElements([1, 2], onIteratorRelease: { released.fulfill() })
+    var results = [Int]()
+    do {
+      for try await value in source.share() {
+        results.append(value)
+      }
+      XCTFail("expected the base to fail")
+    } catch {
+      XCTAssertEqual(error as? TestError, .failure)
+    }
+    XCTAssertEqual(results, [1, 2])
+    await fulfillment(of: [released], timeout: 2)
+  }
+
+  // MARK: - Resource Release Helpers
+
+  private func assertReleasesAfterConsumerCancelledDuringBaseNext(
+    bufferingPolicy: AsyncBufferSequencePolicy
+  ) async {
+    let released = expectation(description: "base iterator released")
+    let gate = Gate()
+    let (entered, enteredContinuation) = AsyncStream<Void>.makeStream()
+    let source = GatedTrackedSource(
+      honoursCancellation: false,
+      gate: gate,
+      entered: { enteredContinuation.yield() },
+      onIteratorRelease: { released.fulfill() }
+    )
+    var shared = Optional(source.share(bufferingPolicy: bufferingPolicy))
+    let iterator = shared!.makeAsyncIterator()
+    let consumer = Task.detached {
+      var iterator = iterator
+      return await iterator.next(isolation: nil)
+    }
+    var enteredIterator = entered.makeAsyncIterator()
+    // The iteration is now inside the base's next(), which ignores cancellation.
+    await enteredIterator.next()
+    consumer.cancel()
+    let value = await consumer.value
+    XCTAssertNil(value)
+    shared = nil
+    // Let the base produce an element after the iteration has been cancelled.
+    gate.open()
+    await fulfillment(of: [released], timeout: 2)
+  }
+
+  private func assertReleasesWhenConsumerCancelledAfterSequenceReleased(
+    bufferingPolicy: AsyncBufferSequencePolicy,
+    honoursCancellation: Bool
+  ) async {
+    let released = expectation(description: "base iterator released")
+    let gate = Gate()
+    let (entered, enteredContinuation) = AsyncStream<Void>.makeStream()
+    let source = GatedTrackedSource(
+      honoursCancellation: honoursCancellation,
+      gate: gate,
+      entered: { enteredContinuation.yield() },
+      onIteratorRelease: { released.fulfill() }
+    )
+    var shared = Optional(source.share(bufferingPolicy: bufferingPolicy))
+    let iterator = shared!.makeAsyncIterator()
+    let consumer = Task.detached {
+      var iterator = iterator
+      return await iterator.next(isolation: nil)
+    }
+    var enteredIterator = entered.makeAsyncIterator()
+    // The iteration is inside the base's next(), so the consumer is suspended in next().
+    await enteredIterator.next()
+    shared = nil
+    consumer.cancel()
+    let value = await consumer.value
+    XCTAssertNil(value)
+    if !honoursCancellation {
+      // The base ignored the cancellation; let it produce an element now.
+      gate.open()
+    }
+    await fulfillment(of: [released], timeout: 2)
+  }
+
+  private func assertReleasesWhenStoredSequenceReleasedAfterBreak(
+    bufferingPolicy: AsyncBufferSequencePolicy
+  ) async {
+    let released = expectation(description: "base iterator released")
+    var shared = Optional(
+      TrackedCounter(onIteratorRelease: { released.fulfill() }).share(bufferingPolicy: bufferingPolicy)
+    )
+    for await value in shared! {
+      XCTAssertEqual(value, 1)
+      break
+    }
+    shared = nil
+    await fulfillment(of: [released], timeout: 2)
+  }
 }
 
 // MARK: - Helper Types
 
 private enum TestError: Error, Equatable {
   case failure
+}
+
+private final class ReleaseTracker: Sendable {
+  let onRelease: @Sendable () -> Void
+  init(_ onRelease: @escaping @Sendable () -> Void) { self.onRelease = onRelease }
+  deinit { onRelease() }
+}
+
+/// Counts up from 1 until its task is cancelled. Its iterator calls
+/// `onIteratorRelease` when it is deallocated.
+private struct TrackedCounter: AsyncSequence, Sendable {
+  let onIteratorRelease: @Sendable () -> Void
+
+  struct AsyncIterator: AsyncIteratorProtocol {
+    let tracker: ReleaseTracker
+    var current = 0
+
+    mutating func next() async -> Int? {
+      if Task.isCancelled { return nil }
+      current += 1
+      return current
+    }
+  }
+
+  func makeAsyncIterator() -> AsyncIterator {
+    AsyncIterator(tracker: ReleaseTracker(onIteratorRelease))
+  }
+}
+
+/// Yields `elements` and then finishes. Its iterator calls `onIteratorRelease`
+/// when it is deallocated.
+private struct TrackedElements: AsyncSequence, Sendable {
+  let elements: [Int]
+  let onIteratorRelease: @Sendable () -> Void
+
+  init(_ elements: [Int], onIteratorRelease: @escaping @Sendable () -> Void) {
+    self.elements = elements
+    self.onIteratorRelease = onIteratorRelease
+  }
+
+  struct AsyncIterator: AsyncIteratorProtocol {
+    let tracker: ReleaseTracker
+    var remaining: ArraySlice<Int>
+
+    mutating func next() async -> Int? {
+      remaining.popFirst()
+    }
+  }
+
+  func makeAsyncIterator() -> AsyncIterator {
+    AsyncIterator(tracker: ReleaseTracker(onIteratorRelease), remaining: elements[...])
+  }
+}
+
+/// Yields `elements` and then throws `TestError.failure`. Its iterator calls
+/// `onIteratorRelease` when it is deallocated.
+private struct TrackedFailingElements: AsyncSequence, Sendable {
+  let elements: [Int]
+  let onIteratorRelease: @Sendable () -> Void
+
+  init(_ elements: [Int], onIteratorRelease: @escaping @Sendable () -> Void) {
+    self.elements = elements
+    self.onIteratorRelease = onIteratorRelease
+  }
+
+  struct AsyncIterator: AsyncIteratorProtocol {
+    let tracker: ReleaseTracker
+    var remaining: ArraySlice<Int>
+
+    mutating func next() async throws -> Int? {
+      guard let element = remaining.popFirst() else {
+        throw TestError.failure
+      }
+      return element
+    }
+  }
+
+  func makeAsyncIterator() -> AsyncIterator {
+    AsyncIterator(tracker: ReleaseTracker(onIteratorRelease), remaining: elements[...])
+  }
+}
+
+/// Counts up from 1, but each call to `next()` first calls `entered` and then waits
+/// for `gate` to open. When `honoursCancellation` is true, cancelling the iterating
+/// task ends the wait and `next()` returns nil; otherwise the wait ignores
+/// cancellation. Its iterator calls `onIteratorRelease` when it is deallocated.
+private struct GatedTrackedSource: AsyncSequence, Sendable {
+  let honoursCancellation: Bool
+  let gate: Gate
+  let entered: @Sendable () -> Void
+  let onIteratorRelease: @Sendable () -> Void
+
+  struct AsyncIterator: AsyncIteratorProtocol {
+    let tracker: ReleaseTracker
+    let honoursCancellation: Bool
+    let gate: Gate
+    let entered: @Sendable () -> Void
+    var current = 0
+
+    mutating func next() async -> Int? {
+      entered()
+      if honoursCancellation {
+        await withTaskCancellationHandler {
+          await gate.enter()
+        } onCancel: { [gate] in
+          gate.open()
+        }
+        if Task.isCancelled { return nil }
+      } else {
+        await gate.enter()
+      }
+      current += 1
+      return current
+    }
+  }
+
+  func makeAsyncIterator() -> AsyncIterator {
+    AsyncIterator(
+      tracker: ReleaseTracker(onIteratorRelease),
+      honoursCancellation: honoursCancellation,
+      gate: gate,
+      entered: entered
+    )
+  }
 }
 
 #endif
