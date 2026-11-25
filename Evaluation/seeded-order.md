@@ -108,7 +108,7 @@ With `.unbounded` there is no limit section. The window is the whole of `iterate
 
 ## Operator scenarios: first pass
 
-`Tests/AsyncAlgorithmsTests/TestSeededOperatorRelease.swift` runs 45 resource-release scenarios over five operators: `zip`, `merge`, `combineLatest` (6 each), `flatMapLatest` (7) and `buffer` (5 per policy, 4 policies). It is opt-in (`ASYNC_VALIDATION_EXPLORE=1`), because it reports open bugs.
+`Tests/AsyncAlgorithmsTests/TestSeededOperatorRelease.swift` runs 46 resource-release scenarios over five operators: `zip`, `merge`, `combineLatest` (6 each), `flatMapLatest` (8, including one added later for #472) and `buffer` (5 per policy, 4 policies). It is opt-in (`ASYNC_VALIDATION_EXPLORE=1`), because it reports open bugs.
 
 **How it works.**
 - Each scenario runs inside one diagram tick, so the scheduler owns every job.
@@ -126,6 +126,7 @@ With `.unbounded` there is no limit section. The window is the whole of `iterate
 | `flatMapLatest`, break after first | outer pulled to the cap | 1000/1000 leak (outer, inner) | confirmed: inner iterator never released | **not on #461's list.** The storage `deinit` cancels nothing. Still leaks on #462's head `af849f7`: 1000/1000 seeds, and FIFO pulls the outer to the cap |
 | `flatMapLatest`, cancel while the inner honours cancellation | leak (inner) | 1000/1000 | not rerun | known: #461, the `cancelled()` path. **Fixed by apple/swift-async-algorithms#462**: 0/1000 seeds leak on its head `af849f7` |
 | `flatMapLatest`, outer throws while the inner is parked | leak (inner) | 901/1000 | not rerun | known: #461, the `outerThrew` path. The 99 clean seeds are orders where the error arrives while no consumer is waiting. **Fixed by #462**: 0/1000 seeds leak |
+| `flatMapLatest`, outer throws between `next()` calls (#472's window, added later) | wrong: finishes with nil instead of the error | wrong 968/1000; the other 32 deliver the error but leak the inner | not rerun | known: #472. **Fixed by your PR apple/swift-async-algorithms#479** (`fix-472`, `31ff7a5`): FIFO ok, 0 wrong, but the same 32 seeds leak. **#462 alone** fixes those 32 leaks and leaves the 968. The two PRs conflict textually, so they weren't run together |
 | `zip`, `merge`, `combineLatest`: all 18 scenarios | ok | 0 failures | | |
 | `flatMapLatest`: run to completion, outer finishes first, inner throws, cancel while the inner ignores cancellation | ok | 0 failures | | the inner-throws scenario uses a finite outer, so it doesn't exercise #461's `innerThrew` path |
 | `buffer`: run to completion, base throws, cancel while the base honours cancellation (4 policies each) | ok | 0 failures | | |
@@ -133,7 +134,7 @@ With `.unbounded` there is no limit section. The window is the whole of `iterate
 **What the seeds added this time: nothing beyond FIFO.** Every bug above fails under FIFO, so the leak and hang checks did the finding. The seeds' contribution is negative evidence: 18 `zip`/`merge`/`combineLatest` scenarios hold under 1,000 interleavings each.
 
 **Not done.**
-- Running these scenarios against your `fix-472` branch. They were run against PR #462 (head `af849f7`, with this branch's scheduler and scenario commits cherry-picked on top): its two #461 fixes hold under FIFO and 1,000 seeds, all 7 `flatMapLatest` scenarios except break-after-first pass, and the `break` leak remains.
+- Running the scenarios with #462 and #479 applied together. The two PRs conflict in `FlatMapLatestStateMachine.swift` and `TestFlatMapLatest.swift`. Separately: on `fix-472`, the six original `flatMapLatest` scenarios match `main` seed for seed, as expected for an error-delivery fix. The added #472 scenario is what tells the branches apart. They were run against PR #462 (head `af849f7`, with this branch's scheduler and scenario commits cherry-picked on top): its two #461 fixes hold under FIFO and 1,000 seeds, all 7 `flatMapLatest` scenarios except break-after-first pass, and the `break` leak remains.
 - Getting the `buffer` fix merged upstream. The open PR #352 already has the fix, and a comment there offers the regression tests.
 - Real-runtime reruns of the two known #461 paths.
 
