@@ -163,7 +163,10 @@ final class TestSeededOperatorRelease: XCTestCase {
           }
         }
         if source.honoursCancellation && Task.isCancelled { return nil }
-        if let failAfter = source.failAfter, produced == failAfter { throw ScenarioError() }
+        if let failAfter = source.failAfter, produced == failAfter {
+          source.probe.entered("\(source.name) threw")
+          throw ScenarioError()
+        }
         if produced == (source.count ?? Source.cap) {
           if source.count == nil {
             source.probe.violation("\(source.name) was pulled \(Source.cap) times")
@@ -378,6 +381,29 @@ final class TestSeededOperatorRelease: XCTestCase {
         let (values, error) = await collect(stream)
         if !(error is ScenarioError) {
           probe.violation("expected the failure, got \(values) \(String(describing: error))")
+        }
+      },
+      Scenario(name: "flatMapLatest/outer-throws-between-next-calls") { probe in
+        // #472: the outer fails while the consumer is between `next()` calls, so no demand is pending.
+        // The next `next()` must throw that failure, not finish with nil.
+        let outerGate = Gate()
+        let innerGate = Gate()
+        let stream: Stream = Source(name: "outer", probe: probe, failAfter: 1, gateAfter: 1, gate: outerGate)
+          .flatMapLatest { x in Source(name: "inner\(x)", probe: probe, offset: x * 10, gateAfter: 1, gate: innerGate) }
+          .map { "\($0)" }
+        var iterator = stream.makeAsyncIterator()
+        do {
+          let first = try await iterator.next()
+          if first != "11" { probe.violation("first element was \(String(describing: first))") }
+          // Let the outer fail, and stay out of `next()` until it has thrown.
+          outerGate.open()
+          await probe.awaitEntered("outer threw")
+          let second = try await iterator.next()
+          probe.violation("expected the outer failure, got \(String(describing: second))")
+        } catch is ScenarioError {
+          // expected
+        } catch {
+          probe.violation("unexpected error \(error)")
         }
       },
       Scenario(name: "flatMapLatest/inner-throws") { probe in
