@@ -326,11 +326,36 @@ extension AsyncSequenceValidationDiagram {
     return (result, failures)
   }
 
+  /// Runs a validation diagram with the strategy the environment selects (see
+  /// ``SchedulingStrategy/current``), which is ``SchedulingStrategy/fifo`` unless
+  /// `ASYNC_VALIDATION_SCHEDULE_SEED` is set.
   public static func test<Test: AsyncSequenceValidationTest, Theme: AsyncSequenceValidationTheme>(
     theme: Theme,
     @AsyncSequenceValidationDiagram _ build: (AsyncSequenceValidationDiagram) -> Test
   ) throws -> (ExpectationResult, [ExpectationFailure]) {
+    try self.test(theme: theme, scheduling: .current, observer: nil, build)
+  }
+
+  /// Runs a validation diagram with an explicit scheduling strategy, ignoring the environment.
+  public static func test<Test: AsyncSequenceValidationTest, Theme: AsyncSequenceValidationTheme>(
+    theme: Theme,
+    scheduling: SchedulingStrategy,
+    @AsyncSequenceValidationDiagram _ build: (AsyncSequenceValidationDiagram) -> Test
+  ) throws -> (ExpectationResult, [ExpectationFailure]) {
+    try self.test(theme: theme, scheduling: scheduling, observer: nil, build)
+  }
+
+  /// Runs a validation diagram and reports the description of every scheduler item, in the order
+  /// the items run. For testing the scheduler itself.
+  @_spi(Testing)
+  public static func test<Test: AsyncSequenceValidationTest, Theme: AsyncSequenceValidationTheme>(
+    theme: Theme,
+    scheduling: SchedulingStrategy,
+    observer: (@Sendable (String) -> Void)?,
+    @AsyncSequenceValidationDiagram _ build: (AsyncSequenceValidationDiagram) -> Test
+  ) throws -> (ExpectationResult, [ExpectationFailure]) {
     let diagram = AsyncSequenceValidationDiagram()
+    diagram.queue.configure(scheduling, trace: SchedulingStrategy.traceEnabled, observer: observer)
     let clock = diagram._clock
     let test = build(diagram)
     for index in 0..<test.inputs.count {

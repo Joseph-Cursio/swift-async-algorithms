@@ -46,11 +46,17 @@ extension XCTestCase {
     var failures = [AsyncSequenceValidationDiagram.ExpectationFailure]()
     let baseLoc = AsyncSequenceValidation.SourceLocation(file: file, line: line)
     var accountedFailures = [AsyncSequenceValidationDiagram.ExpectationFailure]()
+    // A failure under a seeded schedule names the seed, so that the run can be replayed.
+    let scheduling = AsyncSequenceValidationDiagram.SchedulingStrategy.current
+    let replay =
+      scheduling.seed.map {
+        " [schedule seed \($0); replay with \(AsyncSequenceValidationDiagram.SchedulingStrategy.seedEnvironmentVariable)=\($0) SWIFT_DETERMINISTIC_HASHING=1]"
+      } ?? ""
     do {
-      (result, failures) = try AsyncSequenceValidationDiagram.test(theme: theme, build)
+      (result, failures) = try AsyncSequenceValidationDiagram.test(theme: theme, scheduling: scheduling, build)
       for failure in failures {
         if expectations.remove(failure.description) == nil {
-          recordFailure(failure.description, at: failure.specification?.location ?? baseLoc)
+          recordFailure(failure.description + replay, at: failure.specification?.location ?? baseLoc)
         } else {
           accountedFailures.append(failure)
         }
@@ -69,12 +75,12 @@ extension XCTestCase {
       let expected = result.reconstituteExpected(theme: theme)
       let actual = result.reconstituteActual(theme: theme)
       if expected != actual {
-        XCTFail("Validation failure:\nExpected:\n\(expected)\nActual:\n\(actual)", file: file, line: line)
+        XCTFail("Validation failure\(replay):\nExpected:\n\(expected)\nActual:\n\(actual)", file: file, line: line)
       }
     }
     // any remaining expectations are failures that were expected but did not happen
     for expectation in expectations {
-      XCTFail("Expected failure: \(expectation) did not occur.", file: file, line: line)
+      XCTFail("Expected failure: \(expectation) did not occur.\(replay)", file: file, line: line)
     }
   }
 
