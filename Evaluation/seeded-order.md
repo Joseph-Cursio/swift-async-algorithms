@@ -4,8 +4,9 @@
 
 - **FIFO is unchanged.** Under FIFO, the scheduler runs the same items in the same order as at `963eecf`: every one of the 10,484 steps across all 102 `validate { }` tests matches. A unit test pins six golden schedules recorded from the unmodified scheduler.
 - **The existing marble tests: 0 failures** under FIFO and seeds 1...1000, with `SWIFT_DETERMINISTIC_HASHING=1` (102,102 test runs). So there are no operator bugs and no marble-diagram ambiguities to classify. One caveat: 62 of the 96 diagrams that reach the scheduler have no choice point at all, so for them every seed is the FIFO schedule. All 20 throttle and timer diagrams fall in that group.
-- **#473 case 12 is caught.** With the pre-fix code (`088f92a`), FIFO releases the base iterator, but **56 of 1,000 seeds leak it with `bounded(1)` and 16 of 1,000 with `.unbounded`**. With the fix (`f1b8dcc`), **0 of 1,000** leak, and with PR #480's fix (`f5284b2`), **0 of 10,000** leak. Deleting only the 3-line cancelled check in `iterate()`'s demand section, which both fixes share, brings back the same seed lists in each. The leaking interleaving is shown [below](#case-12-the-interleaving).
+- **#473 case 12 is caught.** With the pre-fix code (`088f92a`), FIFO releases the base iterator, but **48 of 1,000 seeds leak it with `bounded(1)` and 18 of 1,000 with `.unbounded`**. With the fix (`f1b8dcc`), **0 of 1,000** leak, and with PR #480's fix (`f5284b2`), **0 of 10,000** leak. Deleting only the 3-line cancelled check in `iterate()`'s demand section, which both fixes share, brings back the same seed lists in each. The leaking interleaving is shown [below](#case-12-the-interleaving).
 - **Operator scenarios, first pass: a known but unmerged `buffer` bug, and known `flatMapLatest` bugs.** For all four buffer policies, a `break` out of `for await` never releases the base iterator. With `.unbounded`, `bufferingLatest` and `bufferingOldest`, the producer task also keeps pulling the base, about 520 elements a second on the real runtime. It is already reported upstream as open PR apple/swift-async-algorithms#352 (May 2025), which uses the same fix. My first search missed that PR, so an earlier version of this report wrongly called the bug new. The PR shows only the `bounded(1)` leak; a comment there now adds the unbounded policies and the regression tests. **This branch also fixes it**: each `buffer` iterator holds a small class whose `deinit` interrupts the storage, the same pattern `merge`, `zip` and `combineLatest` use. The `flatMapLatest` leaks match #461. One more case, `flatMapLatest` after a `break`, is not on #461's list, and is now filed upstream as apple/swift-async-algorithms#481. `zip`, `merge` and `combineLatest` passed every scenario under FIFO and 1,000 seeds. Every one of these bugs also fails under FIFO, so the [scenarios](#operator-scenarios-first-pass) found them, not the seeds.
+- **Operator scenarios, second pass: no new bugs.** The three-input `zip`, `merge` and `combineLatest`, `debounce`, `AsyncChannel` and `AsyncThrowingChannel` pass 36 of 37 scenarios under FIFO and 1,000 seeds; the one failure reproduces the known #475. It also turned up a flaw in the seeded scheduler: what a seed did depended on memory reuse. That is now fixed, and every seed count in this report was remeasured with the fix ([details](#seed-numbers-and-memory-reuse)).
 - **Act on these before upstreaming:** the case-12 check on this branch is opt-in (`ASYNC_VALIDATION_SHARE_CASE12=1`), because `main` doesn't have a #473 fix and the check fails there. It adds public API (`SchedulingStrategy`, `test(theme:scheduling:_:)`). It was run only on macOS 27.3 with Swift 6.4.2, not on Linux.
 
 ## What was built
@@ -16,11 +17,11 @@ The change lives in `Sources/AsyncSequenceValidation/`.
 |---|---|---|
 | `SchedulingStrategy` | `SchedulingStrategy.swift` | Public. `.fifo` (the default) or `.seeded(UInt64)`. `.current` reads `ASYNC_VALIDATION_SCHEDULE_SEED` and falls back to `.fifo` when the variable is unset or not an unsigned integer. |
 | `SplitMix64` | `SchedulingStrategy.swift` | Internal. The reference algorithm, so a seed gives the same sequence on any platform. Checked against the published vector for seed 1234567. |
-| Seeded drain | `WorkQueue.swift`, `State.takeRandomReady()` | Gathers every ready item and picks one with the generator. Ready means a task job, or a clock wake-up or input emission whose deadline has passed. It runs that item, then picks again, so work the item enqueues competes with work that was already ready. Virtual time advances only when nothing is ready. |
+| Seeded drain | `WorkQueue.swift`, `State.takeRandomReady()` | Gathers every ready item, numbers them in enqueue order (token generation), and picks one with the generator. Ready means a task job, or a clock wake-up or input emission whose deadline has passed. It runs that item, then picks again, so work the item enqueues competes with work that was already ready. Virtual time advances only when nothing is ready. |
 | FIFO drain | `WorkQueue.swift`, `drain()` / `advance()` | Unchanged except for an `observer?(item.description)` call before each `item.run()`, which is nil unless a test passes one. |
 | Entry points | `Test.swift` | `test(theme:_:)` now uses `.current`. New public `test(theme:scheduling:_:)`. `@_spi(Testing) test(theme:scheduling:observer:_:)` reports each step, for testing the scheduler itself. |
 | Replay hint | `AsyncAlgorithms_XCTest/ValidationTest.swift` | Under a seed, each failure message ends with `[schedule seed N; replay with ASYNC_VALIDATION_SCHEDULE_SEED=N SWIFT_DETERMINISTIC_HASHING=1]`. Under FIFO the messages are unchanged, so `expectedFailures:` strings still match. |
-| Trace | `ASYNC_VALIDATION_SCHEDULE_TRACE=1` | Prints each seeded decision: `[schedule seed 2] step 29 @tick 0 pick 1 of 2: work #29`. |
+| Trace | `ASYNC_VALIDATION_SCHEDULE_TRACE=1` | Prints each seeded decision: `[schedule seed 6] step 29 @tick 0 pick 2 of 2: work #30`. |
 
 How the seeded drain differs from FIFO. FIFO takes only the head of each job's queue, collects a round, sorts it by input side and then by enqueue order, and runs the whole round. The seeded drain takes any ready item, one at a time. Any FIFO order is also a possible seeded order.
 
@@ -68,7 +69,7 @@ How much the seeds explored, over seeds 1...200:
 - 96 diagram runs reach the scheduler. The other 6 tests check diagram parse errors and stop before scheduling.
 - **62 of the 96 diagrams have exactly one schedule**: no step ever has more than one ready item. These are single pipelines, where each step wakes exactly one task.
 - The other 34 diagrams get 175 to 200 distinct schedules each, and all of them pass.
-- Over 20 seeds, 191,226 decisions had 1 candidate, 14,830 had 2, 3,440 had 3 and 80 had 4. That is about 9% real choices.
+- Over 20 seeds, 190,944 decisions had 1 candidate, 15,063 had 2, 3,453 had 3 and 83 had 4. That is about 9% real choices.
 
 **Why no ambiguities showed up.** Every existing diagram avoids putting two inputs' events on the same tick in a way that changes the output. The new `mergeSameTick` diagram shows what an ambiguity looks like: `merge("a-c-|", "b-d-|")` is `[ab]-[cd]-|` under FIFO, but some seeds give `[ba]…`, as a real concurrent runtime can. If a contributor writes such a diagram, a seeded run fails and names the seed.
 
@@ -82,13 +83,13 @@ Run in scratch worktrees, each with this branch's scheduler change applied. The 
 
 | Library | FIFO | `bounded(1)`: seeds leaking | `.unbounded`: seeds leaking |
 |---|---|---|---|
-| `088f92a`, before the fix | released | **56 / 1000** (2, 21, 70, 112, 128, …) | **16 / 1000** (212, 231, 238, 243, …) |
+| `088f92a`, before the fix | released | **48 / 1000** (6, 8, 9, 22, 42, …) | **18 / 1000** (1, 62, 87, 147, …) |
 | `f1b8dcc`, the fix (`fix-473-share-leak`) | released | 0 / 1000 | 0 / 1000 |
-| `f1b8dcc` without the 3-line `isCancelled` check in `iterate()`'s demand section | released | 56 / 1000, same seeds as `088f92a` | 16 / 1000, same seeds |
+| `f1b8dcc` without the 3-line `isCancelled` check in `iterate()`'s demand section | released | 48 / 1000, same seeds as `088f92a` | 18 / 1000, same seeds |
 | PR #480 head `f5284b2` (another contributor's fix, based on `088f92a`) | released | 0 / 10000 | 0 / 10000 |
-| `f5284b2` without the same 3-line demand-section check | released | 56 / 1000, same seeds as `088f92a` | 16 / 1000, same seeds |
+| `f5284b2` without the same 3-line demand-section check | released | 48 / 1000, same seeds as `088f92a` | 18 / 1000, same seeds |
 
-Seed 2 leaked in three separate processes with `SWIFT_DETERMINISTIC_HASHING=1` and in three without it. This scenario keeps one consumer in share()'s `sides` dictionary, so dictionary order doesn't matter here.
+Seed 6 leaked in three separate processes with `SWIFT_DETERMINISTIC_HASHING=1` and in three without it. This scenario keeps one consumer in share()'s `sides` dictionary, so dictionary order doesn't matter here.
 
 The rate is lower than the external prototype's 130 of 1,000 for the same case. The two schedulers have different scheduling points and ready sets, so their rates aren't comparable. Neither predicts real-runtime frequency.
 
@@ -96,19 +97,19 @@ The rate is lower than the external prototype's 130 of 1,000 for the same case. 
 
 From `088f92a` with `bounded(1)`, using the scheduler trace plus temporary prints in a scratch copy of `AsyncShareSequence.swift`:
 
-| Step | FIFO (released) | Seed 2 (leaked) |
+| Step | FIFO (released) | Seed 6 (leaked) |
 |---|---|---|
 | 1 | iteration: emits 1, which resumes the consumer | iteration: emits 1, which resumes the consumer |
-| 2 | iteration: re-enters `iterate()` and passes the limit check | iteration: re-enters `iterate()` (step 28, `pick 2 of 2`) |
-| 3 | iteration: demand check, no consumer waiting, **parks on `demand`** | consumer (step 29, `pick 1 of 2`): `break` calls `unregisterSide`. Then `shared = nil` calls `cancel()`, which **finds no `demand` parked** and resumes nothing |
+| 2 | iteration: re-enters `iterate()` and passes the limit check | iteration: re-enters `iterate()` (step 26, `pick 1 of 2`) |
+| 3 | iteration: demand check, no consumer waiting, **parks on `demand`** | consumer (step 29, `pick 2 of 2`): `break` calls `unregisterSide`. Then `shared = nil` calls `cancel()`, which **finds no `demand` parked** and resumes nothing |
 | 4 | consumer: `break` calls `unregisterSide`. `shared = nil` calls `cancel()`, which finds `demand` parked and resumes it | iteration (step 30): passes the limit check. Demand check: no consumer waiting, **parks on `demand`** |
 | 5 | iteration: sees `.cancelled`, ends, and releases the base iterator | nothing will ever resume it. The task, buffer and base iterator stay alive |
 
-With `.unbounded` there is no limit section. The window is the whole of `iterate()` after `emit 1`. In seed 212 the iteration task's next job waits through nine other steps, and the consumer breaks and releases the sequence during them. This is the same race the prototype's independent analysis found and then reproduced on the real runtime. The fix's part 3 closes it: the demand section returns at once when the iteration is already cancelled.
+With `.unbounded` there is no limit section. The window is the whole of `iterate()` after `emit 1`. In seed 1 the iteration task's next job waits through six other steps, and the consumer breaks and releases the sequence during them. This is the same race the prototype's independent analysis found and then reproduced on the real runtime. The fix's part 3 closes it: the demand section returns at once when the iteration is already cancelled.
 
 ## Operator scenarios: first pass
 
-`Tests/AsyncAlgorithmsTests/TestSeededOperatorRelease.swift` runs 46 resource-release scenarios over five operators: `zip`, `merge`, `combineLatest` (6 each), `flatMapLatest` (8, including one added later for #472) and `buffer` (5 per policy, 4 policies). It is opt-in (`ASYNC_VALIDATION_EXPLORE=1`), because it reports open bugs.
+`Tests/AsyncAlgorithmsTests/TestSeededOperatorRelease.swift` runs 46 first-pass resource-release scenarios over five operators: `zip`, `merge`, `combineLatest` (6 each), `flatMapLatest` (8, including one added later for #472) and `buffer` (5 per policy, 4 policies). It is opt-in (`ASYNC_VALIDATION_EXPLORE=1`), because it reports open bugs.
 
 **How it works.**
 - Each scenario runs inside one diagram tick, so the scheduler owns every job.
@@ -125,8 +126,8 @@ With `.unbounded` there is no limit section. The window is the whole of `iterate
 | `buffer`, all 4 policies, cancel while the base ignores cancellation | base pulled to the cap | 1000/1000 | not run | **design question, not a bug.** After cancellation the producer loop keeps pulling a base that ignores cancellation. `zip`, `merge` and `combineLatest` stop in the same scenario |
 | `flatMapLatest`, break after first | outer pulled to the cap | 1000/1000 leak (outer, inner) | confirmed: neither the outer nor the inner iterator is released. Both tasks park waiting for demand: on the real runtime the outer stops after 2 pulls | **filed as apple/swift-async-algorithms#481** (not on #461's list). The storage `deinit` cancels nothing. Still leaks on #462's head `af849f7`: 1000/1000 seeds. Under the scheduler's FIFO the outer is pulled to the cap; the real runtime doesn't show that endless pull |
 | `flatMapLatest`, cancel while the inner honours cancellation | leak (inner) | 1000/1000 | not rerun | known: #461, the `cancelled()` path. **Fixed by apple/swift-async-algorithms#462**: 0/1000 seeds leak on its head `af849f7` |
-| `flatMapLatest`, outer throws while the inner is parked | leak (inner) | 901/1000 | not rerun | known: #461, the `outerThrew` path. The 99 clean seeds are orders where the error arrives while no consumer is waiting. **Fixed by #462**: 0/1000 seeds leak |
-| `flatMapLatest`, outer throws between `next()` calls (#472's window, added later) | wrong: finishes with nil instead of the error | wrong 968/1000; the other 32 deliver the error but leak the inner | not rerun | known: #472. **Fixed by your PR apple/swift-async-algorithms#479** (`fix-472`, `31ff7a5`): FIFO ok, 0 wrong, but the same 32 seeds leak. **#462 alone** fixes those 32 leaks and leaves the 968. The two PRs conflict textually, so they weren't run together |
+| `flatMapLatest`, outer throws while the inner is parked | leak (inner) | 898/1000 | not rerun | known: #461, the `outerThrew` path. The 102 clean seeds are orders where the error arrives while no consumer is waiting. **Fixed by #462**: 0/1000 seeds leak |
+| `flatMapLatest`, outer throws between `next()` calls (#472's window, added later) | wrong: finishes with nil instead of the error | wrong 972/1000; the other 28 deliver the error but leak the inner | not rerun | known: #472. **Fixed by your PR apple/swift-async-algorithms#479** (`fix-472`, `31ff7a5`): FIFO ok, 0 wrong, but the same 28 seeds leak. **#462 alone** fixes those 28 leaks and leaves the 972. The two PRs conflict textually, so they weren't run together |
 | `zip`, `merge`, `combineLatest`: all 18 scenarios | ok | 0 failures | | |
 | `flatMapLatest`: run to completion, outer finishes first, inner throws, cancel while the inner ignores cancellation | ok | 0 failures | | the inner-throws scenario uses a finite outer, so it doesn't exercise #461's `innerThrew` path |
 | `buffer`: run to completion, base throws, cancel while the base honours cancellation (4 policies each) | ok | 0 failures | | |
@@ -148,6 +149,53 @@ Regression tests in `TestBuffer`, on the real runtime:
 - The full suite gives 381 tests, 0 failures and 7 skips (the opt-in scenario tests).
 
 Not changed: after cancellation, the producer still pulls a base that ignores cancellation until that base ends. That is the "design question" row above.
+
+## Operator scenarios: second pass
+
+**No new bugs.** 37 more scenarios cover:
+- the three-input `zip`, `merge` and `combineLatest` (6 each);
+- `debounce`, on the diagram's virtual clock (6);
+- `AsyncChannel` (6) and `AsyncThrowingChannel` (7).
+
+They all pass under FIFO and seeds 1...1000, except `debounce/cancelled-between-next-calls`. That one leaks the base under FIFO and all 1,000 seeds, which reproduces the known open issue apple/swift-async-algorithms#475.
+
+**What the new scenarios check**
+- **Three-input operators:** the two-input scenarios, with a third base, "c", that copies b's length.
+- **`debounce`:** the base sleeps 2 steps on the diagram clock before each element, and debounce waits for 1 quiet step. Scenarios: break after the first element; run to completion; base throws; cancel while the base is parked on a gate, once honouring cancellation and once ignoring it. The sixth is #475's case: the consumer is cancelled while it is outside `next()`, then calls `next()` again.
+- **Channels:** two senders, then `finish()`; the consumer breaks while senders are suspended, then `finish()`; cancel a suspended sender; cancel a waiting consumer; `finish()` while the consumer waits; two consumers and one sender, where every element must reach exactly one consumer, in order. `AsyncThrowingChannel` adds one more: `fail()` while a sender and a consumer are both waiting. A channel still alive when the scenario is checked counts as a leak.
+- **Not covered:** the multi-producer channel. Its noncopyable `Source` API needs a harness of its own.
+
+**Harness changes**
+- Scenarios can run for many ticks, so `debounce` has virtual time.
+- Sources can sleep on the diagram clock.
+- The harness can watch any object, such as a channel, for deallocation.
+- A hang is now "the scenario body never returned". It used to be inferred from the diagram's own output, which assumed every scenario finishes in tick 0.
+- Rerunning all 83 scenarios gave the same verdicts as before for every earlier scenario.
+
+### Seed numbers and memory reuse
+
+**Fixed.** A seed's schedule used to depend on memory reuse. The seeded scheduler now numbers ready work in enqueue order, so it no longer does. Every seed count in this report was remeasured after the fix. Commit messages, fork PR bodies and upstream comments written before it quote the old counts, such as 56/16 for case 12 and 901, 968 and 32 for `flatMapLatest`. Those counts were true for the scheduler of that time.
+
+**What happened**
+- After the second-pass harness changes, two `flatMapLatest` counts moved, deterministically, by a few seeds.
+- Bisecting pinned the shift on one line, `probe.clock = diagram.clock`, which creates no task or continuation.
+- The cause: the scheduler groups ready work into per-job queues keyed by the job's address, and it enumerated candidates queue by queue. A task allocated where a finished task used to live gets the same key, so its work joins the old queue and the candidate order changes.
+
+**The fix.** `takeRandomReady()` now sorts candidates by token generation, which is the order they were enqueued, before the seed picks one. The set of ready items never depended on the grouping, only their order did. The FIFO path is untouched, and its golden-schedule test still passes.
+
+**Evidence**
+- With the fix, `outer-throws-while-inner-parked` gives 898/1000 both with and without that line. It used to give 895 or 901.
+- `outer-throws-between-next-calls` still differs, 28 against 32, but not because of memory reuse:
+  - an extra allocation outside the closure, with nothing in it, gives 32, the same as no line;
+  - a statement that allocates nothing gives 28, the same as with the line.
+- So what matters there is whether the closure runs any statement before `await body(probe)`, which changes how the compiled code splits into jobs. That is a real program difference, which a real runtime would also see, not a scheduler artifact.
+- A seed still replays identically across processes: case 12's seed 6 leaked in six separate runs, three with `SWIFT_DETERMINISTIC_HASHING=1` and three without.
+
+**What stayed the same.** Every verdict, and whether each bug shows up at all, is the same as under the old scheduler:
+- the marble sweep: 0 failures in FIFO plus 1,000 seeds;
+- case 12 on all five library versions;
+- all 83 operator scenarios;
+- the `flatMapLatest` runs on #462 and on `fix-472`.
 
 ## Limitations and open questions
 
@@ -191,8 +239,8 @@ for d in prefix fixed; do (cd $S/$d && git apply $S/strategy.patch && cp $OLDPWD
 Expected output:
 
 ```
-prefix: case12 bounded(1): fifo released, 56 of 1000 seeds leaked: [2, 21, 70, 112, 128, ...]
-prefix: case12 unbounded: fifo released, 16 of 1000 seeds leaked: [212, 231, 238, 243, ...]
+prefix: case12 bounded(1): fifo released, 48 of 1000 seeds leaked: [6, 8, 9, 22, 42, ...]
+prefix: case12 unbounded: fifo released, 18 of 1000 seeds leaked: [1, 62, 87, 147, ...]
 fixed:  case12 bounded(1): fifo released, 0 of 1000 seeds leaked: []
 fixed:  case12 unbounded: fifo released, 0 of 1000 seeds leaked: []
 ```
