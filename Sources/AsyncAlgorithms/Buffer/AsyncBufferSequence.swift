@@ -120,7 +120,41 @@ public struct AsyncBufferSequence<Base: AsyncSequence & Sendable>: AsyncSequence
   }
 
   public struct Iterator: AsyncIteratorProtocol {
+    /// This class is needed to hook the deinit to observe once all references to the ``AsyncIterator`` are dropped.
+    ///
+    /// The producer task of a bounded or unbounded storage holds the storage strongly, so the storage's
+    /// own `deinit` cannot run while that task is alive. Without this hook, an iterator that is dropped
+    /// without its task being cancelled (for example after a `break` out of `for await`) left the
+    /// producer running: parked forever on a full bounded buffer, or pulling the base without end
+    /// into an unbounded one, and in both cases keeping the base iterator alive.
+    ///
+    /// If we get move-only types we should be able to drop this class and use the `deinit` of the ``AsyncIterator`` struct itself.
+    final class InternalClass {
+      private let interrupt: () -> Void
+
+      init(interrupt: @escaping () -> Void) {
+        self.interrupt = interrupt
+      }
+
+      deinit {
+        self.interrupt()
+      }
+    }
+
     var storageType: StorageType
+    let internalClass: InternalClass?
+
+    init(storageType: StorageType) {
+      self.storageType = storageType
+      switch storageType {
+      case .transparent:
+        self.internalClass = nil
+      case .bounded(let storage):
+        self.internalClass = InternalClass { storage.interrupted() }
+      case .unbounded(let storage):
+        self.internalClass = InternalClass { storage.interrupted() }
+      }
+    }
 
     public mutating func next() async rethrows -> Element? {
       switch self.storageType {

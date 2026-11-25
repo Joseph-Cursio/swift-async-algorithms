@@ -336,4 +336,96 @@ final class TestBuffer: XCTestCase {
     }
   }
   #endif
+
+  // MARK: - Resource release
+
+  // Breaking out of `for await` drops the iterator without cancelling the task. The producer task must
+  // still stop and release the base iterator: before, a bounded producer stayed parked on the full
+  // buffer and an unbounded one kept pulling the base, and both kept the base iterator alive forever.
+
+  func test_given_a_base_sequence_when_breaking_out_of_bounded_iteration_then_the_base_iterator_is_released() async {
+    await assertReleasesBaseIteratorAfterBreak(policy: .bounded(1))
+  }
+
+  func test_given_a_base_sequence_when_breaking_out_of_unbounded_iteration_then_the_base_iterator_is_released() async {
+    await assertReleasesBaseIteratorAfterBreak(policy: .unbounded)
+  }
+
+  func test_given_a_base_sequence_when_breaking_out_of_bufferingNewest_iteration_then_the_base_iterator_is_released()
+    async
+  {
+    await assertReleasesBaseIteratorAfterBreak(policy: .bufferingLatest(1))
+  }
+
+  func test_given_a_base_sequence_when_breaking_out_of_bufferingOldest_iteration_then_the_base_iterator_is_released()
+    async
+  {
+    await assertReleasesBaseIteratorAfterBreak(policy: .bufferingOldest(1))
+  }
+
+  func test_given_a_bounded_iterator_when_one_copy_is_dropped_then_the_other_copy_keeps_producing() async {
+    // The producer must keep running while any copy of the iterator can still ask for elements.
+    let released = expectation(description: "base iterator released")
+    released.isInverted = true
+    let buffered = TrackedIndefinite(onIteratorRelease: { released.fulfill() }).buffer(policy: .bounded(1))
+    var iterator: AsyncBufferSequence<TrackedIndefinite>.Iterator? = buffered.makeAsyncIterator()
+    var copy = iterator!
+    let first = await copy.next()
+    XCTAssertEqual(first, 1)
+    iterator = nil
+    XCTAssertNil(iterator)
+    await fulfillment(of: [released], timeout: 0.2)
+    let second = await copy.next()
+    XCTAssertEqual(second, 2)
+  }
+
+  private func assertReleasesBaseIteratorAfterBreak(
+    policy: AsyncBufferSequencePolicy,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) async {
+    let released = expectation(description: "base iterator released")
+    var first: Int?
+    for await value in TrackedIndefinite(onIteratorRelease: { released.fulfill() }).buffer(policy: policy) {
+      first = value
+      break
+    }
+    XCTAssertNotNil(first, file: file, line: line)
+    await fulfillment(of: [released], timeout: 2)
+  }
+}
+
+private final class ReleaseTracker: Sendable {
+  let onRelease: @Sendable () -> Void
+
+  init(_ onRelease: @escaping @Sendable () -> Void) {
+    self.onRelease = onRelease
+  }
+
+  deinit {
+    onRelease()
+  }
+}
+
+/// Counts up until cancelled, yielding before each element, and reports when its iterator is released.
+private struct TrackedIndefinite: AsyncSequence, Sendable {
+  typealias Element = Int
+
+  let onIteratorRelease: @Sendable () -> Void
+
+  struct AsyncIterator: AsyncIteratorProtocol {
+    let tracker: ReleaseTracker
+    var current = 0
+
+    mutating func next() async -> Int? {
+      await Task.yield()
+      if Task.isCancelled { return nil }
+      current += 1
+      return current
+    }
+  }
+
+  func makeAsyncIterator() -> AsyncIterator {
+    AsyncIterator(tracker: ReleaseTracker(onIteratorRelease))
+  }
 }
