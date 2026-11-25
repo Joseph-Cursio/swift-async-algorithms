@@ -45,6 +45,26 @@ final class TestSeededOperatorRelease: XCTestCase {
     private var enteredNames = Set<String>()
     private var waiters = [String: [UnsafeContinuation<Void, Never>]]()
     private var _violations = [String]()
+    private var watched = [(name: String, object: () -> AnyObject?)]()
+    private var _clock: AsyncSequenceValidationDiagram.Clock?
+    private var _finished = false
+
+    /// Set once the scenario body has returned.
+    var finished: Bool {
+      get { lock.withLock { _finished } }
+      set { lock.withLock { _finished = newValue } }
+    }
+
+    /// The diagram's virtual clock, for scenarios that need time to pass.
+    var clock: AsyncSequenceValidationDiagram.Clock {
+      get { lock.withLock { _clock! } }
+      set { lock.withLock { _clock = newValue } }
+    }
+
+    /// Reports `object` as a leak if it is still alive when the scenario is checked.
+    func watch(_ name: String, _ object: AnyObject) {
+      lock.withLock { watched.append((name, { [weak object] in object })) }
+    }
 
     final class Tracker: Sendable {
       let probe: Probe
@@ -70,6 +90,7 @@ final class TestSeededOperatorRelease: XCTestCase {
     var unreleased: [String] {
       lock.withLock {
         made.keys.sorted().filter { made[$0]! != released[$0, default: 0] }
+          + watched.filter { $0.object() != nil }.map(\.name)
       }
     }
 
@@ -142,6 +163,8 @@ final class TestSeededOperatorRelease: XCTestCase {
     var gateAfter: Int? = nil
     var gate: Gate? = nil
     var honoursCancellation = true
+    /// Sleep this long on the diagram clock before each element.
+    var interval: AsyncSequenceValidationDiagram.Clock.Step? = nil
 
     struct AsyncIterator: AsyncIteratorProtocol, Sendable {
       let source: Source
@@ -150,6 +173,13 @@ final class TestSeededOperatorRelease: XCTestCase {
 
       mutating func next() async throws -> Int? {
         await Task.yield()
+        if let interval = source.interval {
+          do {
+            try await source.probe.clock.sleep(for: interval)
+          } catch {
+            if source.honoursCancellation { return nil }
+          }
+        }
         if let gateAfter = source.gateAfter, produced >= gateAfter, let gate = source.gate {
           source.probe.entered(source.name)
           if source.honoursCancellation {
@@ -217,7 +247,15 @@ final class TestSeededOperatorRelease: XCTestCase {
 
   struct Scenario: Sendable {
     let name: String
+    /// How many ticks of virtual time the diagram runs (scenarios without a clock finish in tick 0).
+    var ticks = 3
     let body: @Sendable (Probe) async -> Void
+
+    init(name: String, ticks: Int = 3, body: @escaping @Sendable (Probe) async -> Void) {
+      self.name = name
+      self.ticks = ticks
+      self.body = body
+    }
   }
 
   /// `zip`, `merge` and `combineLatest` share these, with `make` building the operator from two bases.
@@ -488,6 +526,274 @@ final class TestSeededOperatorRelease: XCTestCase {
     }
   }
 
+  /// The three-input `zip`, `merge` and `combineLatest` run the two-input scenarios with a third base,
+  /// "c", that copies b's length and is offset by 200.
+  static func mirror(_ b: Source) -> Source {
+    Source(name: "c", probe: b.probe, count: b.count, offset: 200)
+  }
+
+  static var zip3Scenarios: [Scenario] {
+    twoBaseScenarios(
+      "zip3",
+      make: { a, b in zip(a, b, mirror(b)).map { "\($0.0),\($0.1),\($0.2)" } },
+      checkComplete: { $0 == ["1,101,201", "2,102,202", "3,103,203"] ? nil : "got \($0)" },
+      earlyFinish: (.max, { $0 == ["1,101,201"] ? nil : "got \($0)" })
+    )
+  }
+
+  static var combineLatest3Scenarios: [Scenario] {
+    let monotonic: @Sendable ([String]) -> String? = { values in
+      let triples = values.map { $0.split(separator: ",").map { Int($0)! } }
+      for (previous, next) in zip(triples, triples.dropFirst()) where zip(previous, next).contains(where: { $1 < $0 }) {
+        return "not monotonic: \(values)"
+      }
+      return nil
+    }
+    return twoBaseScenarios(
+      "combineLatest3",
+      make: { a, b in combineLatest(a, b, mirror(b)).map { "\($0.0),\($0.1),\($0.2)" } },
+      checkComplete: { values in
+        if values.last != "3,103,203" { return "last is not 3,103,203: \(values)" }
+        return monotonic(values)
+      },
+      earlyFinish: (
+        5,
+        { values in
+          guard values.allSatisfy({ $0.hasPrefix("1,") }) else { return "got \(values)" }
+          return monotonic(values)
+        }
+      )
+    )
+  }
+
+  static var merge3Scenarios: [Scenario] {
+    let sides: @Sendable ([String]) -> (a: [Int], b: [Int], c: [Int]) = { values in
+      let numbers = values.map { Int($0)! }
+      return (numbers.filter { $0 < 100 }, numbers.filter { $0 > 100 && $0 < 200 }, numbers.filter { $0 > 200 })
+    }
+    return twoBaseScenarios(
+      "merge3",
+      make: { a, b in merge(a, b, mirror(b)).map { "\($0)" } },
+      checkComplete: { values in
+        let (a, b, c) = sides(values)
+        return a == [1, 2, 3] && b == [101, 102, 103] && c == [201, 202, 203] ? nil : "got \(values)"
+      },
+      earlyFinish: (
+        5,
+        { values in
+          let (a, b, c) = sides(values)
+          let inOrder = b == Array(101..<(101 + b.count)) && c == Array(201..<(201 + c.count))
+          return a.count <= 1 && inOrder ? nil : "got \(values)"
+        }
+      )
+    )
+  }
+
+  static var debounceScenarios: [Scenario] {
+    // The base sleeps 2 steps on the diagram clock before each element; debounce waits for 1 quiet
+    // step, so every element comes through.
+    let ticks = 40
+    @Sendable func base(
+      _ probe: Probe,
+      count: Int? = nil,
+      failAfter: Int? = nil,
+      gateAfter: Int? = nil,
+      gate: Gate? = nil,
+      honours: Bool = true
+    ) -> Source {
+      Source(
+        name: "base",
+        probe: probe,
+        count: count,
+        failAfter: failAfter,
+        gateAfter: gateAfter,
+        gate: gate,
+        honoursCancellation: honours,
+        interval: .steps(2)
+      )
+    }
+    @Sendable func debounced(_ source: Source, _ probe: Probe) -> Stream {
+      source.debounce(for: .steps(1), clock: probe.clock).map { "\($0)" }
+    }
+    return [
+      Scenario(name: "debounce/break-after-first", ticks: ticks) { probe in
+        let (values, error) = await collect(debounced(base(probe), probe), limit: 1)
+        if values != ["1"] || error != nil { probe.violation("got \(values) \(String(describing: error))") }
+      },
+      Scenario(name: "debounce/run-to-completion", ticks: ticks) { probe in
+        let (values, error) = await collect(debounced(base(probe, count: 3), probe))
+        if values != ["1", "2", "3"] || error != nil { probe.violation("got \(values) \(String(describing: error))") }
+      },
+      Scenario(name: "debounce/base-throws", ticks: ticks) { probe in
+        let (values, error) = await collect(debounced(base(probe, failAfter: 1), probe))
+        if !(error is ScenarioError) {
+          probe.violation("expected the failure, got \(values) \(String(describing: error))")
+        }
+      },
+      Scenario(name: "debounce/cancel-while-base-ignores-cancellation", ticks: ticks) { probe in
+        let gate = Gate()
+        await cancelWhileParked(probe, parked: "base", open: gate) {
+          debounced(base(probe, gateAfter: 1, gate: gate, honours: false), probe)
+        }
+      },
+      Scenario(name: "debounce/cancel-while-base-honours-cancellation", ticks: ticks) { probe in
+        let gate = Gate()
+        await cancelWhileParked(probe, parked: "base", open: nil) {
+          debounced(base(probe, gateAfter: 1, gate: gate), probe)
+        }
+      },
+      Scenario(name: "debounce/cancelled-between-next-calls", ticks: ticks) { probe in
+        // #475: the consumer takes one element, is cancelled while it is outside `next()`, and then
+        // calls `next()` again, which returns nil. The base must still be released.
+        let gate = Gate()
+        let consumer = Task {
+          var iterator = debounced(base(probe, gateAfter: 1, gate: gate), probe).makeAsyncIterator()
+          let first = try? await iterator.next()
+          if first != "1" { probe.violation("first element was \(String(describing: first))") }
+          probe.entered("consumer has the first element")
+          let hold = Gate()
+          await withTaskCancellationHandler {
+            await hold.enter()
+          } onCancel: {
+            hold.open()
+          }
+          let second = try? await iterator.next()
+          if second != nil { probe.violation("expected nil after cancellation, got \(String(describing: second))") }
+        }
+        await probe.awaitEntered("consumer has the first element")
+        consumer.cancel()
+        await consumer.value
+      },
+    ]
+  }
+
+  /// `AsyncChannel` and `AsyncThrowingChannel` share these. A channel that is still alive when the
+  /// scenario is checked is reported as a leak: something still holds it, such as a parked sender.
+  struct ChannelUnderTest: Sendable {
+    let channel: AnyObject & Sendable
+    let send: @Sendable (Int) async -> Void
+    let finish: @Sendable () -> Void
+    let stream: @Sendable () -> Stream
+  }
+
+  static func channelScenarios(_ name: String, make: @escaping @Sendable () -> ChannelUnderTest) -> [Scenario] {
+    [
+      Scenario(name: "\(name)/two-senders-then-finish") { probe in
+        let channel = make()
+        probe.watch("channel", channel.channel)
+        let consumer = Task { await collect(channel.stream()) }
+        let a = Task { for value in 1...3 { await channel.send(value) } }
+        let b = Task { for value in 101...103 { await channel.send(value) } }
+        await a.value
+        await b.value
+        channel.finish()
+        let (values, error) = await consumer.value
+        let numbers = values.map { Int($0)! }
+        if error != nil || numbers.filter({ $0 < 100 }) != [1, 2, 3] || numbers.filter({ $0 > 100 }) != [101, 102, 103]
+        {
+          probe.violation("got \(values) \(String(describing: error))")
+        }
+      },
+      Scenario(name: "\(name)/consumer-breaks-while-senders-suspended") { probe in
+        let channel = make()
+        probe.watch("channel", channel.channel)
+        let a = Task { for value in 1...3 { await channel.send(value) } }
+        let b = Task { for value in 101...103 { await channel.send(value) } }
+        let (values, _) = await collect(channel.stream(), limit: 1)
+        if values.count != 1 { probe.violation("got \(values)") }
+        // Senders still parked in `send` must be resumed by `finish()`.
+        channel.finish()
+        await a.value
+        await b.value
+      },
+      Scenario(name: "\(name)/cancel-suspended-sender") { probe in
+        let channel = make()
+        probe.watch("channel", channel.channel)
+        let sender = Task { await channel.send(1) }
+        sender.cancel()
+        await sender.value
+        channel.finish()
+        let (values, error) = await collect(channel.stream())
+        if error != nil || values.count > 1 { probe.violation("got \(values) \(String(describing: error))") }
+      },
+      Scenario(name: "\(name)/cancel-waiting-consumer") { probe in
+        let channel = make()
+        probe.watch("channel", channel.channel)
+        let consumer = Task { await collect(channel.stream()) }
+        consumer.cancel()
+        let (values, error) = await consumer.value
+        if !values.isEmpty || error != nil { probe.violation("got \(values) \(String(describing: error))") }
+        channel.finish()
+      },
+      Scenario(name: "\(name)/finish-while-consumer-waiting") { probe in
+        let channel = make()
+        probe.watch("channel", channel.channel)
+        let consumer = Task { await collect(channel.stream()) }
+        await Task.yield()
+        channel.finish()
+        let (values, error) = await consumer.value
+        if !values.isEmpty || error != nil { probe.violation("got \(values) \(String(describing: error))") }
+      },
+      Scenario(name: "\(name)/two-consumers-one-sender") { probe in
+        let channel = make()
+        probe.watch("channel", channel.channel)
+        let first = Task { await collect(channel.stream()) }
+        let second = Task { await collect(channel.stream()) }
+        for value in 1...6 { await channel.send(value) }
+        channel.finish()
+        let (one, errorOne) = await first.value
+        let (two, errorTwo) = await second.value
+        let a = one.map { Int($0)! }
+        let b = two.map { Int($0)! }
+        // Every element reaches exactly one consumer, and each consumer sees its share in order.
+        if errorOne != nil || errorTwo != nil || (a + b).sorted() != Array(1...6) || a != a.sorted() || b != b.sorted()
+        {
+          probe.violation("got \(one) and \(two)")
+        }
+      },
+    ]
+  }
+
+  static var asyncChannelScenarios: [Scenario] {
+    channelScenarios("AsyncChannel") {
+      let channel = AsyncChannel<Int>()
+      return ChannelUnderTest(
+        channel: channel,
+        send: { await channel.send($0) },
+        finish: { channel.finish() },
+        stream: { channel.map { "\($0)" } }
+      )
+    }
+  }
+
+  static var asyncThrowingChannelScenarios: [Scenario] {
+    channelScenarios("AsyncThrowingChannel") {
+      let channel = AsyncThrowingChannel<Int, any Error>()
+      return ChannelUnderTest(
+        channel: channel,
+        send: { await channel.send($0) },
+        finish: { channel.finish() },
+        stream: { channel.map { "\($0)" } }
+      )
+    }
+      + [
+        Scenario(name: "AsyncThrowingChannel/fail-while-sender-and-consumer-waiting") { probe in
+          let channel = AsyncThrowingChannel<Int, any Error>()
+          probe.watch("channel", channel)
+          let sender = Task { await channel.send(2) }
+          let consumer = Task { await collect(channel.map { "\($0)" }) }
+          channel.fail(ScenarioError())
+          // The parked sender must be resumed, and the consumer must end with the failure (possibly
+          // after element 2, if it was taken before the failure).
+          await sender.value
+          let (values, error) = await consumer.value
+          if !(error is ScenarioError) || !(values.isEmpty || values == ["2"]) {
+            probe.violation("expected the failure, got \(values) \(String(describing: error))")
+          }
+        }
+      ]
+  }
+
   // MARK: - Running
 
   enum Verdict: Equatable, CustomStringConvertible {
@@ -518,15 +824,21 @@ final class TestSeededOperatorRelease: XCTestCase {
   static func run(_ scenario: Scenario, _ strategy: Strategy) throws -> Verdict {
     let probe = Probe()
     let body = scenario.body
-    let (_, failures) = try AsyncSequenceValidationDiagram.test(theme: .ascii, scheduling: strategy) {
-      "a--|"
-      $0.inputs[0].map { _ -> String in
+    let tail = String(repeating: "-", count: scenario.ticks - 1) + "|"
+    let (_, failures) = try AsyncSequenceValidationDiagram.test(theme: .ascii, scheduling: strategy) { diagram in
+      "a" + tail
+      diagram.inputs[0].map { _ -> String in
+        probe.clock = diagram.clock
         await body(probe)
+        probe.finished = true
         return "x"
       }
-      "x--|"
+      "x" + tail
     }
-    if !failures.isEmpty {
+    // A scenario that uses the clock emits its "x" whenever it finishes, so the diagram's own
+    // expectation can fail without anything being wrong; whether the body returned is what counts.
+    _ = failures
+    if !probe.finished {
       // The scenario's tasks are still parked. When the diagram ended it cancelled them, and any
       // clean-up now runs on the real executor; let it finish before the next diagram installs the
       // hook again.
@@ -580,5 +892,11 @@ final class TestSeededOperatorRelease: XCTestCase {
   func test_explore_merge() throws { try explore(Self.mergeScenarios) }
   func test_explore_flatMapLatest() throws { try explore(Self.flatMapLatestScenarios) }
   func test_explore_buffer() throws { try explore(Self.bufferScenarios) }
+  func test_explore_zip3() throws { try explore(Self.zip3Scenarios) }
+  func test_explore_combineLatest3() throws { try explore(Self.combineLatest3Scenarios) }
+  func test_explore_merge3() throws { try explore(Self.merge3Scenarios) }
+  func test_explore_debounce() throws { try explore(Self.debounceScenarios) }
+  func test_explore_asyncChannel() throws { try explore(Self.asyncChannelScenarios) }
+  func test_explore_asyncThrowingChannel() throws { try explore(Self.asyncThrowingChannelScenarios) }
 }
 #endif

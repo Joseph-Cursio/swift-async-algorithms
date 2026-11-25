@@ -118,9 +118,11 @@ struct WorkQueue: Sendable {
     // it does not batch: the caller runs the item and asks again, so work the item enqueues
     // competes with work that was already ready.
     mutating func takeRandomReady() -> Item? {
-      var candidates = [(job: Job?, index: Int)]()
-      // `jobs` holds every job in the order it was first seen, so this enumeration (and so the
-      // meaning of a seed) does not depend on dictionary order or on job addresses
+      var candidates = [(job: Job?, index: Int, generation: Int)]()
+      // Candidates are numbered in enqueue order (token generation), not by the queue they sit in.
+      // Queues are keyed by job address, and a task allocated where a finished one used to be gets
+      // the same key, so grouping by queue would make the meaning of a seed depend on memory reuse.
+      // The set of ready items does not depend on the grouping, only their order would.
       for job in jobs {
         guard var queue = queues[job] else { continue }
         var index = 0
@@ -130,11 +132,11 @@ struct WorkQueue: Sendable {
             items.removeValue(forKey: token)
             queue.remove(at: index)
             continue
-          case .work:
-            candidates.append((job, index))
-          case .blocked(_, let when, _), .emit(_, let when, _, _, _):
+          case .work(let token, _):
+            candidates.append((job, index, token.generation))
+          case .blocked(let token, let when, _), .emit(let token, let when, _, _, _):
             if when <= now {
-              candidates.append((job, index))
+              candidates.append((job, index, token.generation))
             }
           }
           index += 1
@@ -144,8 +146,9 @@ struct WorkQueue: Sendable {
       guard candidates.count > 0, random != nil else {
         return nil
       }
+      candidates.sort { $0.generation < $1.generation }
       let choice = random!.next(upperBound: candidates.count)
-      let (job, index) = candidates[choice]
+      let (job, index, _) = candidates[choice]
       let item = queues[job]!.remove(at: index)
       items.removeValue(forKey: item.token)
       if let traceLabel = traceLabel {
