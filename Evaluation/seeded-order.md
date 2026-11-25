@@ -123,7 +123,7 @@ With `.unbounded` there is no limit section. The window is the whole of `iterate
 
 | Scenario | FIFO | Seeds 1...1000 | Real runtime | Status |
 |---|---|---|---|---|
-| `buffer`, all 4 policies, break after first | leak (`bounded(1)`), or base pulled to the cap (the others) | 1000/1000 | confirmed: base never released; unbounded policies pull about 520 elements a second | **known: open PR apple/swift-async-algorithms#352, same fix; also fixed on this branch.** The producer `Task` captures the storage strongly, and only `deinit` calls `interrupted()`, so dropping the iterator never cancels the producer. With the fix, all four scenarios pass under FIFO and 1,000 seeds |
+| `buffer`, all 4 policies, break after first | leak (`bounded(1)`), or base pulled to the cap (the others) | 1000/1000 | confirmed: base never released; unbounded policies pull about 520 elements a second | **known: open PR apple/swift-async-algorithms#352, a related fix; also fixed on this branch.** The producer `Task` captures the storage strongly, and only `deinit` calls `interrupted()`, so dropping the iterator never cancels the producer. With the fix, all four scenarios pass under FIFO and 1,000 seeds |
 | `buffer`, all 4 policies, cancel while the base ignores cancellation | base pulled to the cap | 1000/1000 | not run | **design question, not a bug.** After cancellation the producer loop keeps pulling a base that ignores cancellation. `zip`, `merge` and `combineLatest` stop in the same scenario |
 | `flatMapLatest`, break after first | outer pulled to the cap | 1000/1000 leak (outer, inner) | confirmed: neither the outer nor the inner iterator is released. Both tasks park waiting for demand: on the real runtime the outer stops after 2 pulls | **filed as apple/swift-async-algorithms#481** (not on #461's list). The storage `deinit` cancels nothing. Still leaks on #462's head `af849f7`: 1000/1000 seeds. Under the scheduler's FIFO the outer is pulled to the cap; the real runtime doesn't show that endless pull |
 | `flatMapLatest`, cancel while the inner honours cancellation | leak (inner) | 1000/1000 | not rerun | known: #461, the `cancelled()` path. **Fixed by apple/swift-async-algorithms#462**: 0/1000 seeds leak on its head `af849f7` |
@@ -137,7 +137,7 @@ With `.unbounded` there is no limit section. The window is the whole of `iterate
 
 **Not done.**
 - Running the scenarios with #462 and #479 applied together. The two PRs conflict in `FlatMapLatestStateMachine.swift` and `TestFlatMapLatest.swift`. Separately: on `fix-472`, the six original `flatMapLatest` scenarios match `main` seed for seed, as expected for an error-delivery fix. The added #472 scenario is what tells the branches apart. They were run against PR #462 (head `af849f7`, with this branch's scheduler and scenario commits cherry-picked on top): its two #461 fixes hold under FIFO and 1,000 seeds, all 7 `flatMapLatest` scenarios except break-after-first pass, and the `break` leak remains.
-- Getting the `buffer` fix merged upstream. The open PR #352 already has the fix, and a comment there offers the regression tests.
+- Getting the `buffer` fix merged upstream. The open PR #352 has a working fix but needs a rebase onto `main`; comments there report the scenario results and offer the regression tests.
 - Real-runtime reruns of the two known #461 paths.
 
 ### The `buffer` fix
@@ -150,6 +150,14 @@ Regression tests in `TestBuffer`, on the real runtime:
 - The full suite gives 381 tests, 0 failures and 7 skips (the opt-in scenario tests).
 
 Not changed: after cancellation, the producer still pulls a base that ignores cancellation until that base ends. That is the "design question" row above.
+
+**Upstream PR #352 checked against the same scenarios.** apple/swift-async-algorithms#352 (head `0f367b9`, May 2025) fixes the same leak a slightly different way. It turns both storages into structs, so the producer task no longer keeps a storage object alive, and its iterator owns an `InternalClass` whose `deinit` calls the storage's new `iteratorDeinitialized()`.
+- **Needs a rebase:** it no longer applies cleanly to `main` (`963eecf`). `AsyncBufferSequence.swift` conflicts, because `main`'s storage `next()` now returns a wrapper (`.wrapped?._rethrowGet()`). I resolved this mechanically in a scratch worktree, taking #352's `Iterator` verbatim and adapting only those two calls.
+- **Results, under FIFO and seeds 1...1000:**
+  - break-after-first passes for all four policies. On `main`, under the same harness, all four fail under FIFO and every seed.
+  - All 20 `TestBuffer` tests pass, including this branch's five regression tests.
+  - The "base ignores cancellation" row is unchanged.
+- The results are posted on the PR ([comment](https://github.com/apple/swift-async-algorithms/pull/352#issuecomment-7150597688)).
 
 ## Operator scenarios: second pass
 
