@@ -7,6 +7,7 @@
 - **#473 case 12 is caught.** With the pre-fix code (`088f92a`), FIFO releases the base iterator, but **48 of 1,000 seeds leak it with `bounded(1)` and 18 of 1,000 with `.unbounded`**. With the fix (`f1b8dcc`), **0 of 1,000** leak, and with PR #480's fix (`f5284b2`), **0 of 10,000** leak. Deleting only the 3-line cancelled check in `iterate()`'s demand section, which both fixes share, brings back the same seed lists in each. The leaking interleaving is shown [below](#case-12-the-interleaving).
 - **Operator scenarios, first pass: a known but unmerged `buffer` bug, and known `flatMapLatest` bugs.** For all four buffer policies, a `break` out of `for await` never releases the base iterator. With `.unbounded`, `bufferingLatest` and `bufferingOldest`, the producer task also keeps pulling the base, about 520 elements a second on the real runtime. It is already reported upstream as open PR apple/swift-async-algorithms#352 (May 2025), which uses the same fix. My first search missed that PR, so an earlier version of this report wrongly called the bug new. The PR shows only the `bounded(1)` leak; a comment there now adds the unbounded policies and the regression tests. **This branch also fixes it**: each `buffer` iterator holds a small class whose `deinit` interrupts the storage, the same pattern `merge`, `zip` and `combineLatest` use. The `flatMapLatest` leaks match #461. One more case, `flatMapLatest` after a `break`, is not on #461's list, and is now filed upstream as apple/swift-async-algorithms#481. `zip`, `merge` and `combineLatest` passed every scenario under FIFO and 1,000 seeds. Every one of these bugs also fails under FIFO, so the [scenarios](#operator-scenarios-first-pass) found them, not the seeds.
 - **Operator scenarios, second pass: no new bugs.** The three-input `zip`, `merge` and `combineLatest`, `debounce`, `AsyncChannel` and `AsyncThrowingChannel` pass 36 of 37 scenarios under FIFO and 1,000 seeds; the one failure reproduces the known #475. It also turned up a flaw in the seeded scheduler: what a seed did depended on memory reuse. That is now fixed, and every seed count in this report was remeasured with the fix ([details](#seed-numbers-and-memory-reuse)).
+- **MPSC channel: no leaks or hangs; one contract question.** In 163 of 1,000 seeds, but never under FIFO, a parked `send` throws `AlreadyFinishedError` for an element that is still delivered ([details](#the-mpsc-channel)).
 - **Act on these before upstreaming:** the case-12 check on this branch is opt-in (`ASYNC_VALIDATION_SHARE_CASE12=1`), because `main` doesn't have a #473 fix and the check fails there. It adds public API (`SchedulingStrategy`, `test(theme:scheduling:_:)`). It was run only on macOS 27.3 with Swift 6.4.2, not on Linux.
 
 ## What was built
@@ -163,7 +164,7 @@ They all pass under FIFO and seeds 1...1000, except `debounce/cancelled-between-
 - **Three-input operators:** the two-input scenarios, with a third base, "c", that copies b's length.
 - **`debounce`:** the base sleeps 2 steps on the diagram clock before each element, and debounce waits for 1 quiet step. Scenarios: break after the first element; run to completion; base throws; cancel while the base is parked on a gate, once honouring cancellation and once ignoring it. The sixth is #475's case: the consumer is cancelled while it is outside `next()`, then calls `next()` again.
 - **Channels:** two senders, then `finish()`; the consumer breaks while senders are suspended, then `finish()`; cancel a suspended sender; cancel a waiting consumer; `finish()` while the consumer waits; two consumers and one sender, where every element must reach exactly one consumer, in order. `AsyncThrowingChannel` adds one more: `fail()` while a sender and a consumer are both waiting. A channel still alive when the scenario is checked counts as a leak.
-- **Not covered:** the multi-producer channel. Its noncopyable `Source` API needs a harness of its own.
+- **Not covered here:** the multi-producer channel, which has [its own section](#the-mpsc-channel).
 
 **Harness changes**
 - Scenarios can run for many ticks, so `debounce` has virtual time.
@@ -171,6 +172,32 @@ They all pass under FIFO and seeds 1...1000, except `debounce/cancelled-between-
 - The harness can watch any object, such as a channel, for deallocation.
 - A hang is now "the scenario body never returned". It used to be inferred from the diagram's own output, which assumed every scenario finishes in tick 0.
 - Rerunning all 83 scenarios gave the same verdicts as before for every earlier scenario.
+
+### The MPSC channel
+
+**No leak or hang; one contract question that only seeds reach.** Eight scenarios on `MultiProducerSingleConsumerAsyncChannel`, under FIFO and seeds 1...1000. Seven pass under FIFO and every seed. In the eighth, `no-delivery-after-failed-send`, 163 of 1,000 seeds deliver an element whose `send` threw `AlreadyFinishedError`; FIFO never does. This is the first finding since #473 case 12 that FIFO misses.
+
+**What happens in those seeds**
+1. Producer A's element is accepted and buffered. Because the watermark is reached, A's `send` then parks, waiting for demand.
+2. Producer B calls `finish()`. Any source's `finish()` ends the channel for every source; that is documented.
+3. A's parked `send` is resumed with `AlreadyFinishedError`.
+4. The buffered element is still delivered, as the docs promise for buffered elements.
+
+The docs say `send` "will throw an error" if the channel already terminated, and "returns once more elements should be produced". They don't say what a throw means for an element that was already accepted. A producer that reads the throw as "not sent" could resend the element, or count it as lost. This is an API contract question, not filed upstream.
+
+**Scenarios**
+- two sources send, then one `finish()`: every element arrives;
+- one source finishes while the other sends: every element whose `send` returned normally arrives, in order per source;
+- the same race, with no element delivered after its `send` threw: the 163 seeds above;
+- the consumer breaks while both producers are parked: parked sends fail, both termination callbacks run, buffered elements are released;
+- cancel a producer: the consumer gets a prefix of its elements, in order;
+- `finish(throwing:)` after two elements: the consumer gets both, then the error;
+- every source dropped without `finish()`: the consumer still ends, with every element;
+- the consumer cancelled while waiting: later sends fail without parking, and the termination callback runs.
+
+Every element is a class instance that reports its own deallocation, so buffered elements the channel never releases count as leaks.
+
+**One expectation of mine was wrong.** I first assumed a source's `finish()` ends only that source. It ends the whole channel, while deinitialising needs every source to go. That's documented, so the scenario now finishes once, after both sources are done.
 
 ### Seed numbers and memory reuse
 

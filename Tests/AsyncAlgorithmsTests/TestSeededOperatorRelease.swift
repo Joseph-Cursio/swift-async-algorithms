@@ -48,6 +48,20 @@ final class TestSeededOperatorRelease: XCTestCase {
     private var watched = [(name: String, object: () -> AnyObject?)]()
     private var _clock: AsyncSequenceValidationDiagram.Clock?
     private var _finished = false
+    private var expectations = [String: Bool]()
+
+    /// Records that `name` must happen before the scenario is checked (for example a callback).
+    func expect(_ name: String) {
+      lock.withLock { expectations[name] = false }
+    }
+
+    func fulfil(_ name: String) {
+      lock.withLock { expectations[name] = true }
+    }
+
+    var unfulfilled: [String] {
+      lock.withLock { expectations.keys.sorted().filter { expectations[$0] == false } }
+    }
 
     /// Set once the scenario body has returned.
     var finished: Bool {
@@ -794,6 +808,237 @@ final class TestSeededOperatorRelease: XCTestCase {
       ]
   }
 
+  // MARK: - MultiProducerSingleConsumerAsyncChannel
+
+  typealias MPSC = MultiProducerSingleConsumerAsyncChannel<Item, any Error>
+
+  /// A channel element that reports its own deallocation, so buffered elements the channel never
+  /// releases show up as leaks.
+  final class Item: Sendable {
+    let value: Int
+    let tracker: Probe.Tracker
+    init(_ value: Int, _ probe: Probe) {
+      self.value = value
+      self.tracker = Probe.Tracker(probe, "element \(value)")
+    }
+  }
+
+  /// Shares one noncopyable `Source` with the task that uses it. Each box is used by one task at a
+  /// time.
+  final class SourceBox: @unchecked Sendable {
+    private var source: MPSC.Source?
+
+    init(_ source: consuming MPSC.Source) {
+      self.source = .some(source)
+    }
+
+    func send(_ item: Item) async throws {
+      var taken = source.take()!
+      do {
+        try await taken.send(item)
+      } catch {
+        source = .some(taken)
+        throw error
+      }
+      source = .some(taken)
+    }
+
+    func finish(throwing error: (any Error)? = nil) {
+      if let taken = source.take() {
+        taken.finish(throwing: error)
+      }
+    }
+
+    func makeAdditional() -> SourceBox {
+      var taken = source.take()!
+      let additional = taken.makeAdditionalSource()
+      source = .some(taken)
+      return SourceBox(additional)
+    }
+
+    func onTermination(_ callback: @escaping @Sendable () -> Void) {
+      let taken = source.take()!
+      taken.setOnTerminationCallback(callback)
+      source = .some(taken)
+    }
+  }
+
+  /// Holds the channel's element sequence until a consumer takes it, so that nothing else keeps the
+  /// sequence alive once the consumer is done.
+  final class StreamBox: @unchecked Sendable {
+    private var stream: Stream?
+    init(_ stream: Stream) { self.stream = stream }
+    func take() -> Stream {
+      defer { stream = nil }
+      return stream!
+    }
+  }
+
+  static func makeMPSC(_ probe: Probe, low: Int = 1, high: Int = 2) -> (SourceBox, StreamBox) {
+    var channelAndSource = MPSC.makeChannel(
+      of: Item.self,
+      throwing: (any Error).self,
+      backpressureStrategy: .watermark(low: low, high: high)
+    )
+    let channel = channelAndSource.takeChannel()
+    let source = SourceBox(channelAndSource.source)
+    let elements: Stream = channel.elements().map { "\($0.value)" }
+    return (source, StreamBox(elements))
+  }
+
+  static func startConsumer(_ box: StreamBox, limit: Int = .max) -> Task<(values: [String], error: (any Error)?), Never>
+  {
+    Task { await collect(box.take(), limit: limit) }
+  }
+
+  /// Sends `values` in order, stopping at the first failed send, then finishes the source unless
+  /// `finish` is false. Returns the values whose `send` returned normally, and the one whose `send`
+  /// threw, if any.
+  static func startSender(
+    _ box: SourceBox,
+    _ values: ClosedRange<Int>,
+    _ probe: Probe,
+    finish: Bool = true
+  ) -> Task<(accepted: [Int], failed: Int?), Never> {
+    Task {
+      var accepted = [Int]()
+      var failed: Int?
+      for value in values {
+        do {
+          try await box.send(Item(value, probe))
+          accepted.append(value)
+        } catch {
+          failed = value
+          break
+        }
+      }
+      if finish { box.finish() }
+      return (accepted, failed)
+    }
+  }
+
+  static var mpscScenarios: [Scenario] {
+    [
+      Scenario(name: "MPSC/two-sources-then-one-finish") { probe in
+        let (a, elements) = makeMPSC(probe)
+        let b = a.makeAdditional()
+        let consumer = startConsumer(elements)
+        let senders = [startSender(a, 1...3, probe, finish: false), startSender(b, 101...103, probe, finish: false)]
+        for sender in senders { _ = await sender.value }
+        // Any source's `finish()` ends the channel for every source (documented), so finish once,
+        // after both are done.
+        a.finish()
+        let (values, error) = await consumer.value
+        let numbers = values.map { Int($0)! }
+        if error != nil || numbers.filter({ $0 < 100 }) != [1, 2, 3] || numbers.filter({ $0 > 100 }) != [101, 102, 103]
+        {
+          probe.violation("got \(values) \(String(describing: error))")
+        }
+      },
+      Scenario(name: "MPSC/one-source-finishes-while-other-sends") { probe in
+        // Every element whose `send` returned normally must reach the consumer, in order per source.
+        let (a, elements) = makeMPSC(probe)
+        let b = a.makeAdditional()
+        let consumer = startConsumer(elements)
+        let senderA = startSender(a, 1...3, probe)
+        let senderB = startSender(b, 101...103, probe)
+        let (acceptedA, _) = await senderA.value
+        let (acceptedB, _) = await senderB.value
+        let (values, error) = await consumer.value
+        let numbers = values.map { Int($0)! }
+        let deliveredA = numbers.filter { $0 < 100 }
+        let deliveredB = numbers.filter { $0 > 100 }
+        if error != nil || deliveredA != deliveredA.sorted() || deliveredB != deliveredB.sorted()
+          || !Set(acceptedA).isSubset(of: deliveredA) || !Set(acceptedB).isSubset(of: deliveredB)
+        {
+          probe.violation("accepted \(acceptedA) and \(acceptedB), delivered \(values) \(String(describing: error))")
+        }
+      },
+      Scenario(name: "MPSC/no-delivery-after-failed-send") { probe in
+        // The opposite direction: an element whose `send` threw should not reach the consumer.
+        let (a, elements) = makeMPSC(probe)
+        let b = a.makeAdditional()
+        let consumer = startConsumer(elements)
+        let senderA = startSender(a, 1...3, probe)
+        let senderB = startSender(b, 101...103, probe)
+        let (_, failedA) = await senderA.value
+        let (_, failedB) = await senderB.value
+        let (values, _) = await consumer.value
+        let numbers = Set(values.map { Int($0)! })
+        for failed in [failedA, failedB].compactMap({ $0 }) where numbers.contains(failed) {
+          probe.violation("element \(failed) was delivered although its send threw (delivered \(values))")
+        }
+      },
+      Scenario(name: "MPSC/consumer-breaks-while-producers-suspended") { probe in
+        // The watermark parks producers at 2 buffered elements. When the consumer goes away, parked
+        // sends must fail, every source's termination callback must run, and the buffered elements
+        // must be released.
+        let (a, elements) = makeMPSC(probe)
+        let b = a.makeAdditional()
+        probe.expect("a terminated")
+        probe.expect("b terminated")
+        a.onTermination { probe.fulfil("a terminated") }
+        b.onTermination { probe.fulfil("b terminated") }
+        let senders = [startSender(a, 1...5, probe), startSender(b, 101...105, probe)]
+        let (values, _) = await startConsumer(elements, limit: 1).value
+        if values.count != 1 { probe.violation("got \(values)") }
+        for sender in senders { _ = await sender.value }
+      },
+      Scenario(name: "MPSC/cancel-producer") { probe in
+        let (a, elements) = makeMPSC(probe)
+        let sender = startSender(a, 1...5, probe)
+        await Task.yield()
+        sender.cancel()
+        _ = await sender.value
+        let (values, error) = await startConsumer(elements).value
+        let numbers = values.map { Int($0)! }
+        if error != nil || numbers != Array(1..<(1 + numbers.count)) {
+          probe.violation("got \(values) \(String(describing: error))")
+        }
+      },
+      Scenario(name: "MPSC/finish-with-error-after-elements") { probe in
+        let (a, elements) = makeMPSC(probe, low: 2, high: 4)
+        let consumer = startConsumer(elements)
+        try? await a.send(Item(1, probe))
+        try? await a.send(Item(2, probe))
+        a.finish(throwing: ScenarioError())
+        let (values, error) = await consumer.value
+        if values != ["1", "2"] || !(error is ScenarioError) {
+          probe.violation("got \(values) \(String(describing: error))")
+        }
+      },
+      Scenario(name: "MPSC/sources-dropped-without-finish") { probe in
+        // When every source is gone without finishing, the consumer must still end.
+        var consumer: Task<(values: [String], error: (any Error)?), Never>
+        var senders: [Task<(accepted: [Int], failed: Int?), Never>]
+        do {
+          let (a, elements) = makeMPSC(probe)
+          let b = a.makeAdditional()
+          consumer = startConsumer(elements)
+          senders = [startSender(a, 1...2, probe, finish: false), startSender(b, 101...102, probe, finish: false)]
+        }
+        for sender in senders { _ = await sender.value }
+        senders.removeAll()
+        let (values, error) = await consumer.value
+        let numbers = values.map { Int($0)! }
+        if error != nil || numbers.filter({ $0 < 100 }) != [1, 2] || numbers.filter({ $0 > 100 }) != [101, 102] {
+          probe.violation("got \(values) \(String(describing: error))")
+        }
+      },
+      Scenario(name: "MPSC/consumer-cancelled-while-waiting") { probe in
+        let (a, elements) = makeMPSC(probe)
+        probe.expect("a terminated")
+        a.onTermination { probe.fulfil("a terminated") }
+        let consumer = startConsumer(elements)
+        consumer.cancel()
+        _ = await consumer.value
+        // The consumer is gone, so the channel is finished: sends may fail but must not park.
+        try? await a.send(Item(1, probe))
+        a.finish()
+      },
+    ]
+  }
+
   // MARK: - Running
 
   enum Verdict: Equatable, CustomStringConvertible {
@@ -846,6 +1091,8 @@ final class TestSeededOperatorRelease: XCTestCase {
       return .hang
     }
     if let violation = probe.violations.first { return .wrong(violation) }
+    let unfulfilled = probe.unfulfilled
+    if !unfulfilled.isEmpty { return .wrong("never happened: \(unfulfilled.joined(separator: ", "))") }
     let unreleased = probe.unreleased
     if !unreleased.isEmpty { return .leak(unreleased) }
     return .ok
@@ -898,5 +1145,6 @@ final class TestSeededOperatorRelease: XCTestCase {
   func test_explore_debounce() throws { try explore(Self.debounceScenarios) }
   func test_explore_asyncChannel() throws { try explore(Self.asyncChannelScenarios) }
   func test_explore_asyncThrowingChannel() throws { try explore(Self.asyncThrowingChannelScenarios) }
+  func test_explore_mpscChannel() throws { try explore(Self.mpscScenarios) }
 }
 #endif
