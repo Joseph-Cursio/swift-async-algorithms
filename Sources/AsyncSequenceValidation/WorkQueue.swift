@@ -106,6 +106,55 @@ struct WorkQueue: Sendable {
     var now = AsyncSequenceValidationDiagram.Clock.Instant(when: .zero)
     var generation = 0
 
+    // nil selects the historical FIFO drain; a generator selects the seeded drain
+    var random: SplitMix64?
+    var traceLabel: String?
+    var decisions = 0
+    // called with the description of every item just before it runs, under either strategy
+    var observer: (@Sendable (String) -> Void)?
+
+    // Seeded scheduling: pick one item, uniformly by the generator, from every item that is
+    // ready now. Unlike the FIFO drain this does not take only the head of each job's queue, and
+    // it does not batch: the caller runs the item and asks again, so work the item enqueues
+    // competes with work that was already ready.
+    mutating func takeRandomReady() -> Item? {
+      var candidates = [(job: Job?, index: Int)]()
+      // `jobs` holds every job in the order it was first seen, so this enumeration (and so the
+      // meaning of a seed) does not depend on dictionary order or on job addresses
+      for job in jobs {
+        guard var queue = queues[job] else { continue }
+        var index = 0
+        while index < queue.count {
+          switch queue[index] {
+          case .cancelled(let token):
+            items.removeValue(forKey: token)
+            queue.remove(at: index)
+            continue
+          case .work:
+            candidates.append((job, index))
+          case .blocked(_, let when, _), .emit(_, let when, _, _, _):
+            if when <= now {
+              candidates.append((job, index))
+            }
+          }
+          index += 1
+        }
+        queues[job] = queue
+      }
+      guard candidates.count > 0, random != nil else {
+        return nil
+      }
+      let choice = random!.next(upperBound: candidates.count)
+      let (job, index) = candidates[choice]
+      let item = queues[job]!.remove(at: index)
+      items.removeValue(forKey: item.token)
+      if let traceLabel = traceLabel {
+        print("[\(traceLabel)] step \(decisions) @\(now) pick \(choice + 1) of \(candidates.count): \(item)")
+      }
+      decisions += 1
+      return item
+    }
+
     mutating func drain() -> [Item] {
       var items = [Item]()
       // store off the jobs such that we can only visit the active queues
@@ -290,7 +339,46 @@ struct WorkQueue: Sendable {
     }
   }
 
+  func configure(
+    _ strategy: AsyncSequenceValidationDiagram.SchedulingStrategy,
+    trace: Bool,
+    observer: (@Sendable (String) -> Void)?
+  ) {
+    state.withCriticalRegion { state in
+      state.observer = observer
+      switch strategy.kind {
+      case .fifo:
+        state.random = nil
+        state.traceLabel = nil
+      case .seeded(let seed):
+        state.random = SplitMix64(seed: seed)
+        state.traceLabel = trace ? "schedule seed \(seed)" : nil
+      }
+    }
+  }
+
+  var isSeeded: Bool {
+    state.withCriticalRegion { $0.random != nil }
+  }
+
+  var observer: (@Sendable (String) -> Void)? {
+    state.withCriticalRegion { $0.observer }
+  }
+
+  func drainSeeded() {
+    let observer = self.observer
+    while let item = state.withCriticalRegion({ $0.takeRandomReady() }) {
+      observer?(item.description)
+      item.run()
+    }
+  }
+
   func drain() {
+    if isSeeded {
+      drainSeeded()
+      return
+    }
+    let observer = self.observer
     // keep draining until there is no recursive work to do
     while true {
       var items: [Item] = state.withCriticalRegion { $0.drain() }
@@ -301,12 +389,21 @@ struct WorkQueue: Sendable {
       // first by source order, then by enqueue order
       items.sort()
       for item in items {
+        observer?(item.description)
         item.run()
       }
     }
   }
 
   func advance() {
+    if isSeeded {
+      state.withCriticalRegion { state in
+        state.now = state.now.advanced(by: .steps(1))
+      }
+      drainSeeded()
+      return
+    }
+    let observer = self.observer
     // drain off the advancement
     var items: [Item] = state.withCriticalRegion { state in
       state.now = state.now.advanced(by: .steps(1))
@@ -316,6 +413,7 @@ struct WorkQueue: Sendable {
     // first by source order, then by enqueue order
     items.sort()
     for item in items {
+      observer?(item.description)
       item.run()
     }
 
