@@ -123,9 +123,9 @@ With `.unbounded` there is no limit section. The window is the whole of `iterate
 |---|---|---|---|---|
 | `buffer`, all 4 policies, break after first | leak (`bounded(1)`), or base pulled to the cap (the others) | 1000/1000 | confirmed: base never released; unbounded policies pull about 520 elements a second | **known: open PR apple/swift-async-algorithms#352, same fix; also fixed on this branch.** The producer `Task` captures the storage strongly, and only `deinit` calls `interrupted()`, so dropping the iterator never cancels the producer. With the fix, all four scenarios pass under FIFO and 1,000 seeds |
 | `buffer`, all 4 policies, cancel while the base ignores cancellation | base pulled to the cap | 1000/1000 | not run | **design question, not a bug.** After cancellation the producer loop keeps pulling a base that ignores cancellation. `zip`, `merge` and `combineLatest` stop in the same scenario |
-| `flatMapLatest`, break after first | outer pulled to the cap | 1000/1000 leak (outer, inner) | confirmed: inner iterator never released | **not on #461's list.** The storage `deinit` cancels nothing. From reading its diff, apple/swift-async-algorithms#462 doesn't change this |
-| `flatMapLatest`, cancel while the inner honours cancellation | leak (inner) | 1000/1000 | not rerun | known: #461, the `cancelled()` path, which #462 targets |
-| `flatMapLatest`, outer throws while the inner is parked | leak (inner) | 901/1000 | not rerun | known: #461, the `outerThrew` path. The 99 clean seeds are orders where the error arrives while no consumer is waiting |
+| `flatMapLatest`, break after first | outer pulled to the cap | 1000/1000 leak (outer, inner) | confirmed: inner iterator never released | **not on #461's list.** The storage `deinit` cancels nothing. Still leaks on #462's head `af849f7`: 1000/1000 seeds, and FIFO pulls the outer to the cap |
+| `flatMapLatest`, cancel while the inner honours cancellation | leak (inner) | 1000/1000 | not rerun | known: #461, the `cancelled()` path. **Fixed by apple/swift-async-algorithms#462**: 0/1000 seeds leak on its head `af849f7` |
+| `flatMapLatest`, outer throws while the inner is parked | leak (inner) | 901/1000 | not rerun | known: #461, the `outerThrew` path. The 99 clean seeds are orders where the error arrives while no consumer is waiting. **Fixed by #462**: 0/1000 seeds leak |
 | `zip`, `merge`, `combineLatest`: all 18 scenarios | ok | 0 failures | | |
 | `flatMapLatest`: run to completion, outer finishes first, inner throws, cancel while the inner ignores cancellation | ok | 0 failures | | the inner-throws scenario uses a finite outer, so it doesn't exercise #461's `innerThrew` path |
 | `buffer`: run to completion, base throws, cancel while the base honours cancellation (4 policies each) | ok | 0 failures | | |
@@ -133,7 +133,7 @@ With `.unbounded` there is no limit section. The window is the whole of `iterate
 **What the seeds added this time: nothing beyond FIFO.** Every bug above fails under FIFO, so the leak and hang checks did the finding. The seeds' contribution is negative evidence: 18 `zip`/`merge`/`combineLatest` scenarios hold under 1,000 interleavings each.
 
 **Not done.**
-- Running these scenarios against PR #462 or your `fix-472` branch. The scratch-worktree command was blocked by a permission check.
+- Running these scenarios against your `fix-472` branch. They were run against PR #462 (head `af849f7`, with this branch's scheduler and scenario commits cherry-picked on top): its two #461 fixes hold under FIFO and 1,000 seeds, all 7 `flatMapLatest` scenarios except break-after-first pass, and the `break` leak remains.
 - Getting the `buffer` fix merged upstream. The open PR #352 already has the fix, and a comment there offers the regression tests.
 - Real-runtime reruns of the two known #461 paths.
 
