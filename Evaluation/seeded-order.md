@@ -5,6 +5,7 @@
 - **FIFO is unchanged.** Under FIFO, the scheduler runs the same items in the same order as at `963eecf`: every one of the 10,484 steps across all 102 `validate { }` tests matches. A unit test pins six golden schedules recorded from the unmodified scheduler.
 - **The existing marble tests: 0 failures** under FIFO and seeds 1...1000, with `SWIFT_DETERMINISTIC_HASHING=1` (102,102 test runs). So there are no operator bugs and no marble-diagram ambiguities to classify. One caveat: 62 of the 96 diagrams that reach the scheduler have no choice point at all, so for them every seed is the FIFO schedule. All 20 throttle and timer diagrams fall in that group.
 - **#473 case 12 is caught.** With the pre-fix code (`088f92a`), FIFO releases the base iterator, but **56 of 1,000 seeds leak it with `bounded(1)` and 16 of 1,000 with `.unbounded`**. With the fix (`f1b8dcc`), **0 of 1,000** leak, and with PR #480's fix (`f5284b2`), **0 of 10,000** leak. Deleting only the 3-line cancelled check in `iterate()`'s demand section, which both fixes share, brings back the same seed lists in each. The leaking interleaving is shown [below](#case-12-the-interleaving).
+- **Operator scenarios, first pass: one apparently new bug in `buffer`, and known `flatMapLatest` bugs.** For all four buffer policies, a `break` out of `for await` never releases the base iterator. With `.unbounded`, `bufferingLatest` and `bufferingOldest`, the producer task also keeps pulling the base, about 520 elements a second on the real runtime. I found no upstream issue for it. The `flatMapLatest` leaks match #461. One more case, `flatMapLatest` after a `break`, is not on #461's list. `zip`, `merge` and `combineLatest` passed every scenario under FIFO and 1,000 seeds. Every one of these bugs also fails under FIFO, so the [scenarios](#operator-scenarios-first-pass) found them, not the seeds.
 - **Act on these before upstreaming:** the case-12 check on this branch is opt-in (`ASYNC_VALIDATION_SHARE_CASE12=1`), because `main` doesn't have a #473 fix and the check fails there. It adds public API (`SchedulingStrategy`, `test(theme:scheduling:_:)`). It was run only on macOS 27.3 with Swift 6.4.2, not on Linux.
 
 ## What was built
@@ -104,6 +105,37 @@ From `088f92a` with `bounded(1)`, using the scheduler trace plus temporary print
 | 5 | iteration: sees `.cancelled`, ends, and releases the base iterator | nothing will ever resume it. The task, buffer and base iterator stay alive |
 
 With `.unbounded` there is no limit section. The window is the whole of `iterate()` after `emit 1`. In seed 212 the iteration task's next job waits through nine other steps, and the consumer breaks and releases the sequence during them. This is the same race the prototype's independent analysis found and then reproduced on the real runtime. The fix's part 3 closes it: the demand section returns at once when the iteration is already cancelled.
+
+## Operator scenarios: first pass
+
+`Tests/AsyncAlgorithmsTests/TestSeededOperatorRelease.swift` runs 45 resource-release scenarios over five operators: `zip`, `merge`, `combineLatest` (6 each), `flatMapLatest` (7) and `buffer` (5 per policy, 4 policies). It is opt-in (`ASYNC_VALIDATION_EXPLORE=1`), because it reports open bugs.
+
+**How it works.**
+- Each scenario runs inside one diagram tick, so the scheduler owns every job.
+- Base sequences are tracked sources. Each `next()` starts with `Task.yield()` and returns nil once the source is cancelled. A source can be finite, fail after N elements, or park on a gate, which either honours or ignores cancellation. An "infinite" source is capped at 500 elements, and reaching the cap counts as a violation.
+- When the diagram ends, three things are checked: a base iterator that was never deallocated (**leak**), a scenario that never finished (**hang**), and a failed output invariant (**wrong**).
+- Scenarios: break after the first element; run to completion; one base finishes early; one base throws while another is parked; cancel the consumer while a base is parked on a gate, once with a base that ignores cancellation and once with one that honours it. `flatMapLatest` has its own variants: outer throws while an inner is parked, inner throws, and outer finishes before the inner.
+- FIFO plus seeds 1...1000 for every scenario took 45 s in all.
+
+**Results**
+
+| Scenario | FIFO | Seeds 1...1000 | Real runtime | Status |
+|---|---|---|---|---|
+| `buffer`, all 4 policies, break after first | leak (`bounded(1)`), or base pulled to the cap (the others) | 1000/1000 | confirmed: base never released; unbounded policies pull about 520 elements a second | **apparently new.** The producer `Task` captures the storage strongly, and only `deinit` calls `interrupted()`, so dropping the iterator never cancels the producer |
+| `buffer`, all 4 policies, cancel while the base ignores cancellation | base pulled to the cap | 1000/1000 | not run | **design question, not a bug.** After cancellation the producer loop keeps pulling a base that ignores cancellation. `zip`, `merge` and `combineLatest` stop in the same scenario |
+| `flatMapLatest`, break after first | outer pulled to the cap | 1000/1000 leak (outer, inner) | confirmed: inner iterator never released | **not on #461's list.** The storage `deinit` cancels nothing. From reading its diff, apple/swift-async-algorithms#462 doesn't change this |
+| `flatMapLatest`, cancel while the inner honours cancellation | leak (inner) | 1000/1000 | not rerun | known: #461, the `cancelled()` path, which #462 targets |
+| `flatMapLatest`, outer throws while the inner is parked | leak (inner) | 901/1000 | not rerun | known: #461, the `outerThrew` path. The 99 clean seeds are orders where the error arrives while no consumer is waiting |
+| `zip`, `merge`, `combineLatest`: all 18 scenarios | ok | 0 failures | | |
+| `flatMapLatest`: run to completion, outer finishes first, inner throws, cancel while the inner ignores cancellation | ok | 0 failures | | the inner-throws scenario uses a finite outer, so it doesn't exercise #461's `innerThrew` path |
+| `buffer`: run to completion, base throws, cancel while the base honours cancellation (4 policies each) | ok | 0 failures | | |
+
+**What the seeds added this time: nothing beyond FIFO.** Every bug above fails under FIFO, so the leak and hang checks did the finding. The seeds' contribution is negative evidence: 18 `zip`/`merge`/`combineLatest` scenarios hold under 1,000 interleavings each.
+
+**Not done.**
+- Running these scenarios against PR #462 or your `fix-472` branch. The scratch-worktree command was blocked by a permission check.
+- Writing a fix for, or filing, the `buffer` bug.
+- Real-runtime reruns of the two known #461 paths.
 
 ## Limitations and open questions
 
